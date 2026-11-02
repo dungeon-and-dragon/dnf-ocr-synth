@@ -9,9 +9,19 @@ from PIL import Image, ImageChops, ImageDraw, ImageFilter, features
 from PIL.PngImagePlugin import PngInfo
 
 from .fonts import FontPaths, _Face, _load_face
-from .nickname import validate_nickname
+from .nickname import ValidationResult, validate_nickname
 
 COLOR = (75, 209, 255)
+
+
+@dataclass
+class GlyphLayout:
+    """Hold native glyph rasters on the baseline-relative grid."""
+
+    names: list[str]
+    masks: list[Image.Image]
+    positions: list[tuple[int, int]]
+    advances: list[int]
 
 
 @dataclass
@@ -67,6 +77,19 @@ def _compose(
         layer.paste(mask, (x - left, y - top))
         canvas = ImageChops.lighter(canvas, layer)
     return canvas
+
+
+def _validate_text_request(
+    text: str, profile: str, layout: str
+) -> ValidationResult:
+    validation = validate_nickname(text)
+    if not validation.is_valid:
+        raise ValueError(validation.reason)
+    if profile not in {"dotum", "nanum-neo"}:
+        raise ValueError("profile must be 'dotum' or 'nanum-neo'.")
+    if layout != "metrics":
+        raise ValueError("layout must be 'metrics'.")
+    return validation
 
 
 def _colorize(
@@ -134,44 +157,18 @@ class Renderer:
             f"No glyph for U+{ord(character):04X} in profile {profile}."
         )
 
-    def render(
-        self,
-        text: str,
-        *,
-        profile: str = "dotum",
-        layout: str = "metrics",
-        scale: float = 1.0,
-        color: tuple[int, int, int] = COLOR,
-    ) -> Sample:
-        """Render a nickname with an RGB fill and a 1px black outline.
+    def layout(
+        self, text: str, *, profile: str = "dotum", layout: str = "metrics"
+    ) -> GlyphLayout:
+        """Rasterize glyphs and place them before outline and scaling.
 
-        Scale in (0, 16] applies after rasterization. Missing glyphs
-        raise ValueError. The label is never normalized, trimmed, or
-        changed through character replacement.
-        Color contains three integer RGB values from 0 to 255.
+        Positions are baseline-relative native pixels, so callers can
+        scale glyphs individually. Missing glyphs raise ValueError.
         """
-        validation = validate_nickname(text)
-        if not validation.is_valid:
-            raise ValueError(validation.reason)
-        if profile not in {"dotum", "nanum-neo"}:
-            raise ValueError("profile must be 'dotum' or 'nanum-neo'.")
-        if layout != "metrics":
-            raise ValueError("layout must be 'metrics'.")
-        if len(color) != 3 or any(
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or not 0 <= value <= 255
-            for value in color
-        ):
-            raise ValueError(
-                "color must contain three integers from 0 to 255."
-            )
-        if (
-            isinstance(scale, bool)
-            or not math.isfinite(scale)
-            or not 0 < scale <= 16
-        ):
-            raise ValueError("scale must be finite and in (0, 16].")
+        _validate_text_request(text, profile, layout)
+        return self._layout(text, profile)
+
+    def _layout(self, text: str, profile: str) -> GlyphLayout:
         names = [self._select(character, profile) for character in text]
         masks = []
         positions = []
@@ -192,7 +189,44 @@ class Renderer:
             positions.append((cursor + x, y))
             advances.append(advance)
             cursor += advance
-        mask = _compose(masks, positions)
+        return GlyphLayout(names, masks, positions, advances)
+
+    def render(
+        self,
+        text: str,
+        *,
+        profile: str = "dotum",
+        layout: str = "metrics",
+        scale: float = 1.0,
+        color: tuple[int, int, int] = COLOR,
+    ) -> Sample:
+        """Render a nickname with an RGB fill and a 1px black outline.
+
+        Scale in (0, 16] applies after rasterization. Missing glyphs
+        raise ValueError. The label is never normalized, trimmed, or
+        changed through character replacement.
+        Color contains three integer RGB values from 0 to 255.
+        """
+        validation = _validate_text_request(text, profile, layout)
+        if len(color) != 3 or any(
+            isinstance(value, bool)
+            or not isinstance(value, int)
+            or not 0 <= value <= 255
+            for value in color
+        ):
+            raise ValueError(
+                "color must contain three integers from 0 to 255."
+            )
+        if (
+            isinstance(scale, bool)
+            or not math.isfinite(scale)
+            or not 0 < scale <= 16
+        ):
+            raise ValueError("scale must be finite and in (0, 16].")
+        glyphs = self._layout(text, profile)
+        names = glyphs.names
+        advances = glyphs.advances
+        mask = _compose(glyphs.masks, glyphs.positions)
         image = _colorize(mask, scale, color)
         inspected_fonts = dict.fromkeys(
             ["nanum", *names] if profile == "nanum-neo" else names
