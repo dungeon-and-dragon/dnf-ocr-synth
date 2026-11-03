@@ -1,11 +1,14 @@
 """Compare composites with captured crops the way dfragon binarizes.
 
-The gray conversion and Otsu threshold are ported from dfragon's
+The gray conversions, Otsu threshold, and the raid frame-line and
+detached-pixel removal are ported from dfragon's
 ``packages/client-core/src/lib/nickname-pixels.ts`` so mismatch counts
-describe what the OCR model would see.
+describe what the OCR model would see. ``SCREENS`` names the two crop
+sources with their binarization.
 """
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
@@ -14,6 +17,9 @@ GRAY_WEIGHTS = (9798, 19235, 3735)
 GRAY_SHIFT = 15
 MIN_CLASS_PROBABILITY = 2.0**-23
 NICKNAME_BACKGROUND = 255
+FRAME_EDGE_MARGIN_RATIO = 1 / 5
+FRAME_LINE_WIDTH_RATIO = 3 / 4
+RAID_DETACHED_GAP_RATIO = 4 / 17
 
 
 def bt601_gray(rgba: np.ndarray) -> np.ndarray:
@@ -62,14 +68,22 @@ def otsu_threshold(histogram: list[int], count: int, total: int) -> int:
     return threshold
 
 
-def binarize_nickname_pixels(rgba: np.ndarray) -> np.ndarray:
-    """Port binarizeNicknamePixels; ink becomes 0 and the rest 255."""
+def darkest_channel(rgba: np.ndarray) -> np.ndarray:
+    """Return the minimum of the RGB channels of (..., 3+) pixels."""
+    pixels = np.asarray(rgba, dtype=np.uint8)
+
+    return pixels[..., :3].min(axis=-1)
+
+
+def _binarize_text_pixels(
+    rgba: np.ndarray, brightness: Callable[[np.ndarray], np.ndarray]
+) -> np.ndarray:
     source = np.asarray(rgba, dtype=np.uint8)
     flat = source.reshape(-1, 4)
     output = np.empty_like(flat)
     if flat.size == 0:
         return output.reshape(source.shape)
-    gray = bt601_gray(flat)
+    gray = brightness(flat)
     histogram = np.bincount(gray, minlength=256).tolist()
     threshold = otsu_threshold(histogram, gray.size, int(gray.sum()))
     value = np.where(gray > threshold, 0, NICKNAME_BACKGROUND)
@@ -77,6 +91,116 @@ def binarize_nickname_pixels(rgba: np.ndarray) -> np.ndarray:
     output[:, 3] = 255
 
     return output.reshape(source.shape)
+
+
+def binarize_nickname_pixels(rgba: np.ndarray) -> np.ndarray:
+    """Port binarizeNicknamePixels; ink becomes 0 and the rest 255."""
+    return _binarize_text_pixels(rgba, bt601_gray)
+
+
+def binarize_raid_text_pixels(rgba: np.ndarray) -> np.ndarray:
+    """Port binarizeRaidTextPixels: Otsu on the darkest channel."""
+    return _binarize_text_pixels(rgba, darkest_channel)
+
+
+def _frame_line_pixels(ink: np.ndarray) -> np.ndarray:
+    """Port excludeNicknameFrameLines on a boolean (H, W) ink map.
+
+    Runs of ink at least 3/4 of the width long count as frame lines,
+    but only in the rows within the top or bottom fifth of the crop.
+    """
+    height, width = ink.shape
+    margin = math.floor(height * FRAME_EDGE_MARGIN_RATIO)
+    min_line_width = math.ceil(width * FRAME_LINE_WIDTH_RATIO)
+    lines = np.zeros_like(ink)
+    for y in (*range(margin), *range(height - margin, height)):
+        start = 0
+        for x in range(width + 1):
+            if x < width and ink[y, x]:
+                continue
+
+            if x - start >= min_line_width:
+                lines[y, start:x] = True
+            start = x + 1
+
+    return lines
+
+
+def remove_raid_nickname_frame_lines(binary: np.ndarray) -> np.ndarray:
+    """Port removeRaidNicknameFrameLines on a binarized crop."""
+    result = np.asarray(binary, dtype=np.uint8).copy()
+    lines = _frame_line_pixels(result[..., 0] < NICKNAME_BACKGROUND)
+    result[lines, :3] = NICKNAME_BACKGROUND
+
+    return result
+
+
+@dataclass
+class _ColumnCluster:
+    left: int
+    right: int
+    count: int
+
+
+def remove_detached_raid_nickname_pixels(binary: np.ndarray) -> np.ndarray:
+    """Port removeDetachedRaidNicknamePixels on a binarized crop.
+
+    Columns with ink are grouped into clusters separated by at least
+    ``round(height * 4 / 17)`` empty columns, and every cluster but the
+    one with the most ink pixels is cleared.
+    """
+    result = np.asarray(binary, dtype=np.uint8).copy()
+    height, width = result.shape[:2]
+    # JS Math.round rounds halves up, unlike Python's round().
+    min_gap = max(1, math.floor(height * RAID_DETACHED_GAP_RATIO + 0.5))
+    counts = (result[..., 0] < NICKNAME_BACKGROUND).sum(axis=0)
+    clusters: list[_ColumnCluster] = []
+    for x in range(width):
+        count = int(counts[x])
+        if count == 0:
+            continue
+
+        if clusters and x - clusters[-1].right - 1 < min_gap:
+            clusters[-1].right = x
+            clusters[-1].count += count
+        else:
+            clusters.append(_ColumnCluster(x, x, count))
+    if not clusters:
+        return result
+    main = max(clusters, key=lambda cluster: cluster.count)
+    for cluster in clusters:
+        if cluster is not main:
+            result[:, cluster.left : cluster.right + 1, :3] = (
+                NICKNAME_BACKGROUND
+            )
+
+    return result
+
+
+def binarize_raid_nickname_pixels(rgba: np.ndarray) -> np.ndarray:
+    """Port binarizeRaidNicknamePixels on an (H, W, 4) crop."""
+    source = np.asarray(rgba, dtype=np.uint8)
+    if source.ndim != 3 or source.shape[2] != 4:
+        raise ValueError("raid crop must be an (H, W, 4) RGBA array.")
+
+    return remove_detached_raid_nickname_pixels(
+        remove_raid_nickname_frame_lines(binarize_raid_text_pixels(source))
+    )
+
+
+SCREEN_BINARIZERS = {
+    "party": binarize_nickname_pixels,
+    "raid": binarize_raid_nickname_pixels,
+}
+SCREENS = tuple(SCREEN_BINARIZERS)
+
+
+def binarize_for_screen(screen: str, rgba: np.ndarray) -> np.ndarray:
+    """Binarize an (H, W, 4) crop as the product does on ``screen``."""
+    if screen not in SCREEN_BINARIZERS:
+        raise ValueError(f"screen must be one of {SCREENS}.")
+
+    return SCREEN_BINARIZERS[screen](rgba)
 
 
 def dilate(mask: np.ndarray, radius: int = 1) -> np.ndarray:
@@ -126,19 +250,31 @@ class Reference:
     gray: np.ndarray
     ink: np.ndarray
     background: np.ndarray
+    screen: str
 
     @classmethod
-    def from_rgba(cls, rgba: np.ndarray, scale: float) -> "Reference":
-        """Prepare a (H, W, 4) uint8 crop captured at ``scale``."""
+    def from_rgba(
+        cls, rgba: np.ndarray, scale: float, screen: str
+    ) -> "Reference":
+        """Prepare a (H, W, 4) crop of ``screen`` captured at ``scale``.
+
+        ``screen`` picks the product binarization: ``party`` uses the
+        BT.601 Otsu and ``raid`` the darkest-channel Otsu with frame
+        lines and detached pixels removed.
+        """
         pixels = np.asarray(rgba, dtype=np.uint8)
         if pixels.ndim != 3 or pixels.shape[2] != 4:
             raise ValueError("crop must be an (H, W, 4) RGBA array.")
-        ink = binarize_nickname_pixels(pixels)[..., 0] == 0
+        ink = binarize_for_screen(screen, pixels)[..., 0] == 0
         text_region = dilate(ink, math.ceil(2 * scale) + 1)
         gray = bt601_gray(pixels)
         background = inpaint_rows(pixels, text_region)
 
-        return cls(pixels, gray, ink, background)
+        return cls(pixels, gray, ink, background, screen)
+
+    def binarize(self, rgba: np.ndarray) -> np.ndarray:
+        """Binarize another crop-sized image with this crop's screen."""
+        return binarize_for_screen(self.screen, rgba)
 
     @property
     def ink_count(self) -> int:
@@ -210,7 +346,7 @@ def compare(
         mae = float(difference[region].mean())
     else:
         mae = math.inf
-    binary = binarize_nickname_pixels(composite)[..., 0] == 0
+    binary = reference.binarize(composite)[..., 0] == 0
     mismatch = int((binary != reference.ink).sum())
 
     return Comparison(mae, mismatch, reference.ink_count)

@@ -6,9 +6,10 @@
         --x 76 --width 178 --y 49
 
 ``index.json`` and ``manifest.json`` follow dfragon's
-``party-nickname-evaluation`` script, which writes crops as
+``nickname-evaluation`` script, which writes crops as
 ``{caseId}_slot{n}.png`` next to ``index.json`` and keeps the labeled
-nicknames in the manifest.
+nicknames in the manifest. Both name the ``screen`` (``party`` or
+``raid``) a crop came from; raid slots are the rows 1 to 12.
 """
 
 import argparse
@@ -29,7 +30,7 @@ from .align import (
     estimate_text_origin,
     search_alignment,
 )
-from .metrics import Reference, edge_profile
+from .metrics import SCREENS, Reference, edge_profile
 from .pipelines import (
     DEFAULT_PIPELINE,
     enumerate_pipelines,
@@ -53,13 +54,24 @@ def _require(mapping: dict, key: str, where: str):
     return mapping[key]
 
 
+def _require_screen(mapping: dict, where: str) -> str:
+    screen = _require(mapping, "screen", where)
+    if screen not in SCREENS:
+        raise ValueError(f"{where} screen must be one of {SCREENS}.")
+
+    return screen
+
+
 def load_samples(
     crops_index: Path, manifest: Path, include_uncertain: bool
 ) -> tuple[list[SampleInfo], list[Skipped]]:
     """Join crop index entries with manifest labels.
 
     Crops without a label are skipped, and uncertain labels are
-    skipped unless ``include_uncertain`` is set.
+    skipped unless ``include_uncertain`` is set. Every crop entry and
+    manifest case must name its ``screen``, and the two must agree, so
+    an index written before screens existed is rejected instead of
+    being read as party crops.
     """
     index = json.loads(crops_index.read_text(encoding="utf-8"))
     labels = {}
@@ -68,8 +80,10 @@ def load_samples(
     )
     for case in cases:
         case_id = _require(case, "id", "manifest case")
+        screen = _require_screen(case, "manifest case")
         for slot in _require(case, "slots", "manifest case"):
             labels[(case_id, _require(slot, "slot", "manifest slot"))] = (
+                screen,
                 _require(slot, "text", "manifest slot"),
                 bool(slot.get("uncertain", False)),
             )
@@ -78,13 +92,20 @@ def load_samples(
     for position, entry in enumerate(_require(index, "crops", "crop index")):
         where = f"crops[{position}]"
         case_id = _require(entry, "caseId", where)
+        screen = _require_screen(entry, where)
         slot = _require(entry, "slot", where)
         sample_id = f"{case_id}_slot{slot}"
         label = labels.get((case_id, slot))
         if label is None:
             skipped.append(Skipped(sample_id, "manifest에 정답이 없음"))
             continue
-        text, uncertain = label
+        case_screen, text, uncertain = label
+        if case_screen != screen:
+            raise ValueError(
+                f"{where} screen {screen!r} differs from manifest case "
+                f"{case_id!r} screen {case_screen!r}."
+            )
+
         if uncertain and not include_uncertain:
             skipped.append(Skipped(sample_id, "정답이 uncertain"))
             continue
@@ -92,6 +113,7 @@ def load_samples(
             SampleInfo(
                 sample_id,
                 case_id,
+                screen,
                 slot,
                 _require(entry, "file", where),
                 float(_require(entry, "scale", where)),
@@ -122,6 +144,15 @@ def _parse_fit(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--color", nargs=3, type=int, metavar=("R", "G", "B"), default=COLOR
     )
+    parser.add_argument(
+        "--outline-px",
+        choices=("pipeline", "0"),
+        default="pipeline",
+        help=(
+            "Outline thickness: each pipeline's own (default) or 0 for "
+            "name cells drawn without an outline"
+        ),
+    )
     parser.add_argument("--radius", type=int, default=SEARCH_RADIUS)
     parser.add_argument("--top", type=int, default=5)
     parser.add_argument("--include-uncertain", action="store_true")
@@ -132,6 +163,7 @@ def _parse_fit(argv: list[str]) -> argparse.Namespace:
     if any(not 0 <= value <= 255 for value in args.color):
         parser.error("--color values must be between 0 and 255")
     args.color = tuple(args.color)
+    args.outlined = args.outline_px == "pipeline"
 
     return args
 
@@ -167,7 +199,9 @@ def run_fit(args: argparse.Namespace) -> None:
             skipped.append(Skipped(sample.id, f"렌더 실패: {error}"))
             continue
         reference = Reference.from_rgba(
-            _load_crop(args.crops.parent / sample.file), sample.scale
+            _load_crop(args.crops.parent / sample.file),
+            sample.scale,
+            sample.screen,
         )
         base = render_with_pipeline(
             glyphs.masks,
@@ -175,6 +209,7 @@ def run_fit(args: argparse.Namespace) -> None:
             sample.scale,
             args.color,
             DEFAULT_PIPELINE,
+            args.outlined,
         )
         crop_text_origin = estimate_text_origin(
             reference, np.asarray(base.image), base.text_origin, args.color
@@ -186,6 +221,7 @@ def run_fit(args: argparse.Namespace) -> None:
                 sample.scale,
                 args.color,
                 pipeline,
+                args.outlined,
             )
             best = best_candidate(
                 search_alignment(
@@ -220,6 +256,7 @@ def run_fit(args: argparse.Namespace) -> None:
         "top": args.top,
         "profile": args.profile,
         "color": list(args.color),
+        "outline_px": "pipeline" if args.outlined else 0,
         "crops": str(args.crops),
         "manifest": str(args.manifest),
     }
@@ -242,7 +279,9 @@ def _write_residuals(
     for sample in samples:
         glyphs = renderer.layout(sample.text, profile=args.profile)
         reference = Reference.from_rgba(
-            _load_crop(args.crops.parent / sample.file), sample.scale
+            _load_crop(args.crops.parent / sample.file),
+            sample.scale,
+            sample.screen,
         )
         for entry in rankings.get(sample.bucket, []):
             fit = by_key[(sample.id, entry.pipeline)]
@@ -252,6 +291,7 @@ def _write_residuals(
                 sample.scale,
                 args.color,
                 by_name[entry.pipeline],
+                args.outlined,
             )
             residual_image(
                 reference, np.asarray(rendered.image), fit.origin

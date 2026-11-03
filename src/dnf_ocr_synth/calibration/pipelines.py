@@ -188,14 +188,18 @@ def render_with_pipeline(
     scale: float,
     color: tuple[int, int, int],
     pipeline: ScalePipeline,
+    outlined: bool = True,
 ) -> PipelineRender:
     """Outline, color, and scale a glyph layout with one hypothesis.
 
     The native ink origin (the union box of all glyphs) lands at an
     integer canvas position, so sub-pixel phase comes only from the
     pipeline. At scale 1 the default pipeline matches ``_colorize``.
+    ``outlined=False`` draws no outline at all, for name cells whose
+    text has none; the pipeline's outline width then changes nothing,
+    while its stage still picks coloring before or after scaling.
     """
-    outline = pipeline.outline_pixels(scale)
+    outline = pipeline.outline_pixels(scale) if outlined else 0
     padding = outline + 1
     margin = math.ceil(padding * scale)
     composed = _compose(masks, positions)

@@ -9,12 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .metrics import (
-    Reference,
-    binarize_nickname_pixels,
-    bt601_gray,
-    composite_over,
-)
+from .metrics import Reference, bt601_gray, composite_over
 
 RESIDUAL_ZOOM = 4
 OBJECTIVE = (
@@ -29,6 +24,7 @@ class SampleInfo:
 
     id: str
     case_id: str
+    screen: str
     slot: int
     file: str
     scale: float
@@ -136,10 +132,7 @@ def residual_image(
     composite, _ = composite_over(reference, synthetic, origin)
     crop_gray = bt601_gray(crop).astype(np.int16)
     difference = np.abs(crop_gray - bt601_gray(composite).astype(np.int16))
-    mismatch = (
-        binarize_nickname_pixels(crop)[..., 0]
-        != binarize_nickname_pixels(composite)[..., 0]
-    )
+    mismatch = (reference.binarize(composite)[..., 0] == 0) != reference.ink
     diff_rgb = np.repeat(difference.astype(np.uint8)[..., None], 3, axis=2)
     diff_rgb[mismatch] = [255, 0, 0]
     panels = [
@@ -220,12 +213,17 @@ def _markdown(
     at_boundary = sum(
         max(abs(fit.offset[0]), abs(fit.offset[1])) == radius for fit in fits
     )
+    outline = (
+        "외곽선 없음"
+        if settings.get("outline_px") == 0
+        else "파이프라인 외곽선"
+    )
     sections = [
         "# 글자 확대 가설 맞추기 결과",
         "",
         f"- 파이프라인 {settings['pipeline_count']}개, "
         f"오프셋 반경 {radius}px, 샘플 {len(samples)}개, "
-        f"건너뜀 {len(skipped)}개",
+        f"건너뜀 {len(skipped)}개, 렌더 {outline}",
         f"- {OBJECTIVE}",
         "- 불일치 비율은 불일치 픽셀 수를 실기 crop의 잉크 픽셀 수로 "
         "나눈 값이다.",
@@ -272,6 +270,7 @@ def _markdown(
             rows.append(
                 [
                     sample.id,
+                    sample.screen,
                     sample.text,
                     f"{sample.scale:.2f}",
                     f"`{own.pipeline}`",
@@ -288,6 +287,7 @@ def _markdown(
             _markdown_table(
                 [
                     "샘플",
+                    "화면",
                     "닉네임",
                     "s",
                     "샘플 최적 파이프라인",
