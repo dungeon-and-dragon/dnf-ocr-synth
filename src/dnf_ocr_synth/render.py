@@ -10,8 +10,17 @@ from PIL.PngImagePlugin import PngInfo
 
 from .fonts import FontPaths, _Face, _load_face
 from .nickname import ValidationResult, validate_nickname
+from .scale_model import (
+    ScaleModel,
+    SeparableKernel,
+    resample_layers,
+    resolve_scale_model,
+)
 
 COLOR = (75, 209, 255)
+PADDING = 2
+# The measured kernel reaches 2.5 native px past the 1px outline.
+KERNEL_PADDING = 3
 
 
 @dataclass
@@ -96,8 +105,8 @@ def _colorize(
     mask: Image.Image, scale: float, color: tuple[int, int, int]
 ) -> Image.Image:
     # Padding holds the 1px square outline and a transparent margin.
-    ink = Image.new("L", (mask.width + 4, mask.height + 4))
-    ink.paste(mask, (2, 2))
+    ink = Image.new("L", (mask.width + 2 * PADDING, mask.height + 2 * PADDING))
+    ink.paste(mask, (PADDING, PADDING))
     alpha = ink.filter(ImageFilter.MaxFilter(3))
     # Premultiply ink by its coverage within the black outline.
     channels = [
@@ -117,6 +126,60 @@ def _colorize(
             resample=Image.Resampling.BILINEAR,
         )
     return image.convert("RGBA")
+
+
+def _kernel_colorize(
+    mask: Image.Image,
+    scale: float,
+    color: tuple[int, int, int],
+    kernel: SeparableKernel,
+) -> Image.Image:
+    size = (mask.width + 2 * KERNEL_PADDING, mask.height + 2 * KERNEL_PADDING)
+    ink = Image.new("L", size)
+    ink.paste(mask, (KERNEL_PADDING, KERNEL_PADDING))
+    outlined = ink.filter(ImageFilter.MaxFilter(3))
+    if scale == 1:
+        # The game draws s=1 text as the native raster itself.
+        fill = Image.new("RGB", size, color)
+        image = Image.new("RGB", size)
+        image.paste(fill, mask=ink.point(lambda value: 255 * (value > 0)))
+        image.putalpha(outlined.point(lambda value: 255 * (value > 0)))
+
+        return image
+
+    def binary_rows(layer: Image.Image) -> list[list[float]]:
+        values = list(layer.get_flattened_data())
+
+        return [
+            [float(value > 0) for value in values[y : y + layer.width]]
+            for y in range(0, len(values), layer.width)
+        ]
+
+    output = (math.ceil(size[0] * scale), math.ceil(size[1] * scale))
+    coverage, filled = resample_layers(
+        [binary_rows(outlined), binary_rows(ink)], scale, kernel, output
+    )
+    pixels = []
+    for coverage_row, filled_row in zip(coverage, filled):
+        for alpha, fill in zip(coverage_row, filled_row):
+            alpha = min(alpha, 1.0)
+            opacity = round(alpha * 255)
+            if opacity <= 0:
+                pixels.append((0, 0, 0, 0))
+                continue
+            pixels.append(
+                (
+                    *(
+                        round(min(255.0, max(0.0, value * fill / alpha)))
+                        for value in color
+                    ),
+                    opacity,
+                )
+            )
+    image = Image.new("RGBA", output)
+    image.putdata(pixels)
+
+    return image
 
 
 class Renderer:
@@ -199,6 +262,7 @@ class Renderer:
         layout: str = "metrics",
         scale: float = 1.0,
         color: tuple[int, int, int] = COLOR,
+        scale_model: str | ScaleModel = "affine-bilinear",
     ) -> Sample:
         """Render a nickname with an RGB fill and a 1px black outline.
 
@@ -206,8 +270,12 @@ class Renderer:
         raise ValueError. The label is never normalized, trimmed, or
         changed through character replacement.
         Color contains three integer RGB values from 0 to 255.
+        ``scale_model`` names a model of ``SCALE_MODELS`` or is a
+        ``ScaleModel``; the default keeps the 0.1.2 output. A kernel
+        model needs a scale of at least 1, where it was measured.
         """
         validation = _validate_text_request(text, profile, layout)
+        model = resolve_scale_model(scale_model)
         if len(color) != 3 or any(
             isinstance(value, bool)
             or not isinstance(value, int)
@@ -223,17 +291,34 @@ class Renderer:
             or not 0 < scale <= 16
         ):
             raise ValueError("scale must be finite and in (0, 16].")
-        glyphs = self._layout(text, profile)
+        if model.kernel is not None and scale < 1:
+            raise ValueError(f"{model.name} needs a scale of at least 1.")
+        if model.glyph_layout == "raid-name":
+            # calibration.layout imports this module, so load it late.
+            from .calibration.layout import raid_layout
+
+            glyphs = raid_layout(self, text, profile, "ink")
+        else:
+            glyphs = self._layout(text, profile)
         names = glyphs.names
         advances = glyphs.advances
         mask = _compose(glyphs.masks, glyphs.positions)
-        image = _colorize(mask, scale, color)
+        if model.kernel is None:
+            image = _colorize(mask, scale, color)
+            padding = PADDING
+            resampling = "bilinear-premultiplied"
+        else:
+            image = _kernel_colorize(mask, scale, color, model.kernel)
+            padding = KERNEL_PADDING
+            resampling = (
+                "native" if scale == 1 else "separable-kernel-premultiplied"
+            )
         inspected_fonts = dict.fromkeys(
             ["nanum", *names] if profile == "nanum-neo" else names
         )
         metadata = {
-            "schema_version": 1,
-            "renderer_version": "0.1.2",
+            "schema_version": 2,
+            "renderer_version": "0.2.0",
             "text": text,
             "codepoints": [f"U+{ord(character):04X}" for character in text],
             "cp949_bytes": validation.byte_length,
@@ -243,10 +328,11 @@ class Renderer:
             "foreground_rgb": list(color),
             "outline_rgb": [0, 0, 0],
             "outline_px": 1,
-            "padding_px": 2,
+            "padding_px": padding,
             "native_ink_size": list(mask.size),
             "image_size": list(image.size),
-            "resampling": "bilinear-premultiplied",
+            "resampling": resampling,
+            "scale_model": model.metadata(),
             "layout_engine": "Pillow BASIC",
             "pillow_version": Image.__version__,
             "freetype_version": features.version_module("freetype2"),

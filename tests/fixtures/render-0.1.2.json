@@ -1,0 +1,257 @@
+{
+ "source": "dnf-ocr-synth 0.1.2 (main 809df79) Renderer.render(text, scale=scale), sha256 of image.tobytes()",
+ "samples": [
+  {
+   "text": "검신",
+   "scale": 1.0,
+   "size": [
+    23,
+    14
+   ],
+   "sha256": "393f5276771957e3083ca21ba1b581a83a4d0d58d1e1f6018c5e33f4181081b5"
+  },
+  {
+   "text": "검신",
+   "scale": 1.25,
+   "size": [
+    29,
+    18
+   ],
+   "sha256": "1fe0b3e610b6362a421d3915c9425fe27eaf410b44a73441cabca5347a160615"
+  },
+  {
+   "text": "검신",
+   "scale": 1.8,
+   "size": [
+    42,
+    26
+   ],
+   "sha256": "7e86ffd133b783905ff1cede728d52478f9937745b9ead0d886332ad5a298c5b"
+  },
+  {
+   "text": "검신",
+   "scale": 2.4,
+   "size": [
+    56,
+    34
+   ],
+   "sha256": "54b8ff6d0850aff553f39858b63e6cfffe172baadb6aff9c3ecf607b205452c0"
+  },
+  {
+   "text": "가나다라마바",
+   "scale": 1.0,
+   "size": [
+    68,
+    14
+   ],
+   "sha256": "75d83509d4361a41d0e6fe7d4ad29f9acd8c225018bfb535c14b6e2785117478"
+  },
+  {
+   "text": "가나다라마바",
+   "scale": 1.25,
+   "size": [
+    85,
+    18
+   ],
+   "sha256": "9410df217280f52ddcf0d71696be5c1ee0cb3f57334573e19c8c83619fdfea46"
+  },
+  {
+   "text": "가나다라마바",
+   "scale": 1.8,
+   "size": [
+    123,
+    26
+   ],
+   "sha256": "59c72eb882b10333a2357154d67d284d4a35a99c5c80311560806d9c250d4461"
+  },
+  {
+   "text": "가나다라마바",
+   "scale": 2.4,
+   "size": [
+    164,
+    34
+   ],
+   "sha256": "fbabecb60384a73a488dad32469182f98e60a46dbd83d7f4cb6c42060f466ff1"
+  },
+  {
+   "text": "MyGM",
+   "scale": 1.0,
+   "size": [
+    27,
+    14
+   ],
+   "sha256": "50286172dba946a62a782a96d88182c522cb232a253b25b9465d1f761d7a8ffe"
+  },
+  {
+   "text": "MyGM",
+   "scale": 1.25,
+   "size": [
+    34,
+    18
+   ],
+   "sha256": "cc294f9966b55c2113fba18e2ff68ff6052c20f34b5dff16a87eb15d07fc6e4d"
+  },
+  {
+   "text": "MyGM",
+   "scale": 1.8,
+   "size": [
+    49,
+    26
+   ],
+   "sha256": "10ed9091ef5923bd01c7c45cabcf6618ed81938e2c0ddcdacdcdafd3277ef903"
+  },
+  {
+   "text": "MyGM",
+   "scale": 2.4,
+   "size": [
+    65,
+    34
+   ],
+   "sha256": "33e0fe542757be53687e5a2caaeecbf2e33071643ea235f473d3a4604fbb549e"
+  },
+  {
+   "text": "ァÐぎ★",
+   "scale": 1.0,
+   "size": [
+    40,
+    12
+   ],
+   "sha256": "f2d6456a8ef55c75acc5538cabf4822f1d21af2559006be33aee96bac68631ca"
+  },
+  {
+   "text": "ァÐぎ★",
+   "scale": 1.25,
+   "size": [
+    50,
+    15
+   ],
+   "sha256": "a0048838d0e9ca68ff4a80989346ecbff7a0b19368fd2dd139c9641731a4df95"
+  },
+  {
+   "text": "ァÐぎ★",
+   "scale": 1.8,
+   "size": [
+    72,
+    22
+   ],
+   "sha256": "350ecc0aaddf0d2d001b857869ebc851d2c103405e124c0a485710f700b9c9b0"
+  },
+  {
+   "text": "ァÐぎ★",
+   "scale": 2.4,
+   "size": [
+    96,
+    29
+   ],
+   "sha256": "83e095a70a4fed7bf54c76d685c35044c4ab313440caf291155b6febc8dbf0e7"
+  },
+  {
+   "text": "Il1O0I123789",
+   "scale": 1.0,
+   "size": [
+    65,
+    12
+   ],
+   "sha256": "5da61f160533f4f879fd061722acb0370f068c0f9a144494b25f9b6ea606d4d0"
+  },
+  {
+   "text": "Il1O0I123789",
+   "scale": 1.25,
+   "size": [
+    82,
+    15
+   ],
+   "sha256": "937f8ccc7f27b7e28b4fae19096c4b1e5e51251b3afd4124f0f41acfa93be570"
+  },
+  {
+   "text": "Il1O0I123789",
+   "scale": 1.8,
+   "size": [
+    117,
+    22
+   ],
+   "sha256": "5a7650ac52fb467e9afa4b7b20031d0e2f8c1bb5471359b5b9964453374e79cb"
+  },
+  {
+   "text": "Il1O0I123789",
+   "scale": 2.4,
+   "size": [
+    156,
+    29
+   ],
+   "sha256": "08fc5bcc39d46aa3a9df8769ffa7a41d0a4a84756e4b0fb95a5d9fadb5cd0728"
+  },
+  {
+   "text": "汞一電進龍",
+   "scale": 1.0,
+   "size": [
+    62,
+    16
+   ],
+   "sha256": "5f13800c90fca8570d09f15e4b5976fb0a3e84c24758b548dcefbf57e130e928"
+  },
+  {
+   "text": "汞一電進龍",
+   "scale": 1.25,
+   "size": [
+    78,
+    20
+   ],
+   "sha256": "3d33eb64cb3d81b474449f036116e4689951c52706ee1902faa7a220fc86df26"
+  },
+  {
+   "text": "汞一電進龍",
+   "scale": 1.8,
+   "size": [
+    112,
+    29
+   ],
+   "sha256": "1d35bc58a58e1dbb902f551bf67d6e74770ac575804e0e601783899091f01c69"
+  },
+  {
+   "text": "汞一電進龍",
+   "scale": 2.4,
+   "size": [
+    149,
+    39
+   ],
+   "sha256": "b5d27a80e4615edfc0c910d3802c9d12dd737c2eb87d935d84f4cf53ddbf42ba"
+  },
+  {
+   "text": "앞!-♥",
+   "scale": 1.0,
+   "size": [
+    31,
+    14
+   ],
+   "sha256": "84f4b6020de124db76b1b941c67af01eba27fb2d5cdfec53fafc738b1eb9b7a6"
+  },
+  {
+   "text": "앞!-♥",
+   "scale": 1.25,
+   "size": [
+    39,
+    18
+   ],
+   "sha256": "b7494d929630b6ba585f96fa9b860a3d8e31028ec67b2ef1d1b09fd57542fe55"
+  },
+  {
+   "text": "앞!-♥",
+   "scale": 1.8,
+   "size": [
+    56,
+    26
+   ],
+   "sha256": "2051faa072d56c50bd9ec53b832890be3d72812bc193f058e6d63a2afc011089"
+  },
+  {
+   "text": "앞!-♥",
+   "scale": 2.4,
+   "size": [
+    75,
+    34
+   ],
+   "sha256": "63dc59e53ee3a29f0e13862f5cd3a652d78fce58f87cdfc9c2d2a8294d5d0896"
+  }
+ ]
+}

@@ -30,3 +30,19 @@ class ColorArgumentTests(unittest.TestCase):
                             + channels
                         )
                 self.assertEqual(error.exception.code, 2)
+
+
+class ScaleModelArgumentTests(unittest.TestCase):
+    def test_default_and_calibrated_model(self):
+        arguments = ["검신", "--output", "sample.png"]
+        self.assertEqual(parse_args(arguments).scale_model, "affine-bilinear")
+        self.assertEqual(
+            parse_args(
+                arguments + ["--scale-model", "calibrated-v1"]
+            ).scale_model,
+            "calibrated-v1",
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as error:
+                parse_args(arguments + ["--scale-model", "bicubic"])
+        self.assertEqual(error.exception.code, 2)
