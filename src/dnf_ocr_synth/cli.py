@@ -5,6 +5,7 @@ from pathlib import Path
 
 from .nickname import estimate_ui_scale
 from .render import COLOR
+from .scale_model import SCALE_MODELS
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -44,6 +45,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     scaling.add_argument("--scale", type=float)
     scaling.add_argument("--ui-percent", type=float)
     parser.add_argument("--client-height", type=int, default=1080)
+    parser.add_argument(
+        "--scale-model",
+        choices=tuple(SCALE_MODELS),
+        default="affine-bilinear",
+        help=(
+            "Scaling method: the 0.1.2 bilinear transform (default) or "
+            "the kernel and raid name layout measured in the game"
+        ),
+    )
     args = parser.parse_args(argv)
     if any(not 0 <= value <= 255 for value in args.color):
         parser.error("--color values must be between 0 and 255")
