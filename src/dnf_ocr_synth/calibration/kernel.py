@@ -297,9 +297,11 @@ def model_composite(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Composite ``background * (1 - A) + color * C`` over the crop.
 
-    Pixels the kernel does not reach keep the captured crop, so an
-    overshooting kernel is kept rather than clipped to the color.
-    Returns the RGBA composite and the map of reached pixels.
+    Every pixel is drawn on the estimated background, so pixels the
+    kernel does not reach show the background and never the captured
+    crop's own ink; an overshooting kernel is kept rather than clipped
+    to the color. Returns the RGBA composite and the map of reached
+    pixels.
     """
     covered = coverage > 0
     background = reference.background[..., :3].astype(np.float64)
@@ -308,9 +310,7 @@ def model_composite(
         + np.array(color, dtype=np.float64) * filled[..., None]
     )
     composite = reference.rgba.copy()
-    composite[covered, :3] = np.rint(np.clip(blended, 0, 255)).astype(
-        np.uint8
-    )[covered]
+    composite[..., :3] = np.rint(np.clip(blended, 0, 255)).astype(np.uint8)
 
     return composite, covered
 

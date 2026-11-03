@@ -33,6 +33,7 @@ class SampleInfo:
     capture: str
     raid: str = ""
     theory: float | None = None
+    crop_origin: tuple[int, int] | None = None
 
     @property
     def bucket(self) -> str:

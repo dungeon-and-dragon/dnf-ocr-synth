@@ -1,11 +1,20 @@
 """Compare measured and standard kernels on captured crops.
 
 Every candidate kernel meets the crops under the same conditions: the
-same estimated background, the same coverage composite, the same
-darkest-channel alignment objective and the same sub-pixel x/y origin
-search. Candidates with parameters (measured taps, a brightness gain)
-are fitted on plain rows and scored in-sample and under hold-out by
-capture or by raid group; fixed shapes have nothing to fit.
+same estimated background, the same coverage composite drawn on that
+background alone, the same darkest-channel alignment objective and
+the same sub-pixel x/y origin search. Candidates with parameters
+(measured taps, a brightness gain) are fitted on plain rows and scored
+in-sample and under hold-out by capture or by raid group; fixed shapes
+have nothing to fit. Kernels can also be loaded from a ``kernels.json``
+written by an earlier run and only scored.
+
+Scoring has two origin modes. ``fitted`` keeps each crop's own
+sub-pixel origin search. ``predicted`` re-scores the crop at the
+origin the raid layout predicts from its capture's anchor (see
+``origins``), so a capture spends three numbers instead of two per
+crop. Captures are classified sharp or blurred by their pure-black
+share (see ``sharpness``) and can be limited to the sharp ones.
 """
 
 import json
@@ -15,7 +24,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -35,7 +44,9 @@ from .kernel import (
     resample,
     tent_taps,
 )
+from .layout import text_box
 from .metrics import Reference, score_composite
+from .origins import CaptureAnchor, Placement, predict_origins
 from .report import (
     SampleInfo,
     Skipped,
@@ -44,12 +55,16 @@ from .report import (
     residual_sheet,
     scale_bucket,
 )
+from .sharpness import SHARP_MIN_PURE_BLACK_RATIO, is_sharp, pure_black_ratio
 
 GATE_RATIO = 0.02
 ALIGNMENT_PASSES = 2
 UNIT_GROUP = "s=1"
 HOLDOUTS = ("capture", "raid")
 SCALE_SOURCES = ("detected", "theory")
+ORIGIN_MODES = ("fitted", "predicted")
+CAPTURE_SETS = ("all", "sharp")
+PREDICTED_SUFFIX = "_predicted"
 
 
 def scale_group(scale: float) -> str:
@@ -263,6 +278,7 @@ class FittedKernel:
     def record(self) -> dict:
         """Describe the kernel as JSON-friendly values."""
         integrals = {
+            "scale": self.scale,
             "integral_x": self.kernel.integral("x", self.scale),
             "integral_y": self.kernel.integral("y", self.scale),
         }
@@ -280,6 +296,20 @@ class FittedKernel:
             "gain": self.kernel.gain,
             **integrals,
         }
+
+    @classmethod
+    def from_record(cls, record: dict) -> "FittedKernel":
+        """Rebuild the kernel a ``record`` described."""
+        if "taps_x" in record:
+            kernel = KernelTaps(
+                tuple(record["taps_x"]),
+                tuple(record["taps_y"]),
+                record["unit"],
+            )
+        else:
+            kernel = StandardKernel(record["shape"], record["gain"])
+
+        return cls(kernel, float(record["scale"]))
 
     def describe(self) -> str:
         """Describe the kernel for the Markdown report."""
@@ -299,12 +329,17 @@ class FittedKernel:
 
 @dataclass
 class Evaluation:
-    """Hold one candidate's fits under one evaluation mode."""
+    """Hold one candidate's fits under one evaluation mode.
+
+    A predicted-origin evaluation lists the capture ``anchors`` its
+    origins came from and no kernels of its own.
+    """
 
     mode: str
     fits: list[KernelFit]
     kernels: dict[str, FittedKernel]
     unevaluated: list[str]
+    anchors: list[CaptureAnchor] = field(default_factory=list)
 
     def by_group(self) -> dict[str, GroupSummary]:
         """Summarize the fits per scale group."""
@@ -408,6 +443,61 @@ def score_sample(
     )
 
     return fit, composite
+
+
+def score_predicted(
+    pool: list[Prepared],
+    samples: list[KernelSample],
+    kernel: Kernel,
+    fold: str = "",
+) -> tuple[list[KernelFit], list[CaptureAnchor], list[str]]:
+    """Re-score the aligned samples at their layout-predicted origins.
+
+    Crops without a crop origin in their index entry cannot be placed
+    in the capture and are left unevaluated.
+    """
+    placements = []
+    aligned = {}
+    unevaluated = []
+    for item, sample in zip(pool, samples):
+        if item.info.crop_origin is None:
+            unevaluated.append(item.info.id)
+            continue
+        placements.append(
+            Placement(
+                item.info.id,
+                item.info.case_id,
+                item.info.slot,
+                item.scale,
+                item.info.crop_origin,
+                text_box(item.glyphs),
+                sample.origin,
+            )
+        )
+        aligned[item.info.id] = (item, sample)
+    origins, anchors = predict_origins(placements)
+    fits = []
+    for sample_id, origin in origins.items():
+        item, sample = aligned[sample_id]
+        fit, _ = score_sample(
+            item, replace(sample, origin=origin), kernel, fold
+        )
+        fits.append(fit)
+
+    return fits, anchors, unevaluated
+
+
+def _add_predicted(
+    evaluation: Evaluation,
+    pool: list[Prepared],
+    samples: list[KernelSample],
+    kernel: Kernel,
+    fold: str = "",
+) -> None:
+    fits, anchors, unevaluated = score_predicted(pool, samples, kernel, fold)
+    evaluation.fits.extend(fits)
+    evaluation.anchors.extend(anchors)
+    evaluation.unevaluated.extend(unevaluated)
 
 
 def _pools(
@@ -555,12 +645,15 @@ def evaluate_candidate(
     holdouts: tuple[str, ...],
     iterations: int,
     aligner: Aligner,
+    origins: tuple[str, ...],
     base: CandidateResult | None = None,
 ) -> CandidateResult:
     """Run the in-sample fit and every hold-out for one candidate.
 
     A derived candidate reuses the fitted kernels of ``base`` through
-    its ``transform`` instead of fitting again.
+    its ``transform`` instead of fitting again. With ``predicted`` in
+    ``origins`` the in-sample crops are also scored at their predicted
+    origins; the hold-outs by capture and raid keep fitted origins.
     """
     if candidate.transform is not None and base is None:
         raise ValueError(
@@ -568,6 +661,7 @@ def evaluate_candidate(
         )
 
     in_sample = Evaluation("in_sample", [], {}, [])
+    predicted = Evaluation(f"in_sample{PREDICTED_SUFFIX}", [], {}, [])
     holdout_evaluations = {
         holdout: Evaluation(f"holdout_{holdout}", [], {}, [])
         for holdout in holdouts
@@ -592,6 +686,8 @@ def evaluate_candidate(
             fit, composite = score_sample(item, sample, kernel)
             in_sample.fits.append(fit)
             composites[item.info.id] = composite
+        if "predicted" in origins:
+            _add_predicted(predicted, pool, samples, kernel)
         for holdout, evaluation in holdout_evaluations.items():
             if candidate.transform is not None:
                 fits, kernels, unevaluated = derived_holdout(
@@ -617,6 +713,8 @@ def evaluate_candidate(
             evaluation.unevaluated.extend(unevaluated)
 
     evaluations = {"in_sample": in_sample}
+    if "predicted" in origins:
+        evaluations[predicted.mode] = predicted
     for evaluation in holdout_evaluations.values():
         evaluations[evaluation.mode] = evaluation
 
@@ -628,23 +726,118 @@ def score_with_kernels(
     prepared: list[Prepared],
     kernels: dict[str, FittedKernel],
     aligner: Aligner,
-) -> tuple[Evaluation, dict[str, np.ndarray]]:
-    """Score separate crops with kernels fitted on another set."""
-    evaluation = Evaluation("holdout_set", [], dict(kernels), [])
+    origins: tuple[str, ...],
+) -> tuple[list[Evaluation], dict[str, np.ndarray]]:
+    """Score separate crops with kernels fitted or loaded elsewhere.
+
+    A fixed candidate missing from ``kernels`` is scored with its own
+    shape. Returns the ``holdout_set`` evaluation, the predicted-origin
+    one when asked, and the composites of the fitted origins.
+    """
+    kernels = dict(kernels)
+    evaluation = Evaluation("holdout_set", [], kernels, [])
+    predicted = Evaluation(f"holdout_set{PREDICTED_SUFFIX}", [], {}, [])
     composites = {}
     for pool_name, pool in _pools(candidate, prepared).items():
+        if pool_name not in kernels and not candidate.fitted:
+            scale = _pool_scale(pool)
+            kernels[pool_name] = FittedKernel(candidate.start(scale), scale)
         fitted = kernels.get(pool_name)
         if fitted is None:
             evaluation.unevaluated.extend(item.info.id for item in pool)
+            predicted.unevaluated.extend(item.info.id for item in pool)
             continue
-        for item, sample in zip(pool, aligner.align(pool, fitted.kernel)):
+        samples = aligner.align(pool, fitted.kernel)
+        for item, sample in zip(pool, samples):
             fit, composite = score_sample(
                 item, sample, fitted.kernel, pool_name
             )
             evaluation.fits.append(fit)
             composites[item.info.id] = composite
+        if "predicted" in origins:
+            _add_predicted(predicted, pool, samples, fitted.kernel, pool_name)
+    evaluations = [evaluation]
+    if "predicted" in origins:
+        evaluations.append(predicted)
 
-    return evaluation, composites
+    return evaluations, composites
+
+
+def load_kernels(path: Path) -> dict[str, dict[str, FittedKernel]]:
+    """Read the kernels of a ``kernels.json`` by candidate and pool."""
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    return {
+        name: {
+            pool: FittedKernel.from_record(record)
+            for pool, record in pools.items()
+        }
+        for name, pools in payload["candidates"].items()
+    }
+
+
+def _kernels_payload(results: list[CandidateResult], settings: dict) -> dict:
+    return {
+        "tool": "dnf_ocr_synth.calibration measured-kernel",
+        "scale_source": settings["scale_source"],
+        "advance": settings.get("advance"),
+        "candidates": {
+            result.candidate.name: {
+                pool: fitted.record()
+                for pool, fitted in result.evaluations[
+                    "in_sample"
+                ].kernels.items()
+            }
+            for result in results
+            if "in_sample" in result.evaluations
+        },
+    }
+
+
+@dataclass(frozen=True)
+class CaptureSharpness:
+    """Record one capture's pure-black share and its verdict."""
+
+    case_id: str
+    ratio: float
+    sharp: bool
+
+
+def capture_sharpness(prepared: list[Prepared]) -> list[CaptureSharpness]:
+    """Classify each capture of ``prepared`` by its pure-black share."""
+    by_case: dict[str, list[np.ndarray]] = defaultdict(list)
+    for item in prepared:
+        by_case[item.info.case_id].append(item.reference.rgba)
+    sharpness = []
+    for case_id, crops in by_case.items():
+        ratio = pure_black_ratio(crops)
+        sharpness.append(CaptureSharpness(case_id, ratio, is_sharp(ratio)))
+
+    return sharpness
+
+
+def keep_sharp(
+    prepared: list[Prepared],
+    sharpness: list[CaptureSharpness],
+    skipped: list[Skipped],
+) -> list[Prepared]:
+    """Drop the crops of blurred captures, recording each as skipped."""
+    blurred = {entry.case_id: entry for entry in sharpness if not entry.sharp}
+    kept = []
+    for item in prepared:
+        entry = blurred.get(item.info.case_id)
+        if entry is None:
+            kept.append(item)
+            continue
+        skipped.append(
+            Skipped(
+                item.info.id,
+                f"흐린 캡처: 순흑 비율 {entry.ratio:.4f} < "
+                f"{SHARP_MIN_PURE_BLACK_RATIO}",
+            )
+        )
+
+    return kept
 
 
 @dataclass(frozen=True)
@@ -705,47 +898,69 @@ def run_measured_kernel(
     ],
     settings: dict,
     fit_samples: list[SampleInfo] | None = None,
+    kernels: dict[str, dict[str, FittedKernel]] | None = None,
 ) -> None:
     """Evaluate the candidates and write the report and residuals.
 
     ``prepare(sample)`` returns ``(glyphs, reference, color)`` or
     raises ValueError or FileNotFoundError for a sample to skip.
     ``settings`` carries ``candidates``, ``holdouts``, ``residuals``,
-    ``iterations``, ``scale_source`` and ``workers``. With
-    ``fit_samples`` the parameters come from those crops, whose
-    in-sample scores stay in the report, and every ``samples`` crop is
-    scored as ``holdout_set``.
+    ``iterations``, ``scale_source``, ``workers``, ``origins`` (the
+    origin modes to score) and ``captures`` (``all`` or ``sharp``, the
+    captures to score). With ``fit_samples`` the parameters come from
+    those crops, whose in-sample scores stay in the report, and every
+    ``samples`` crop is scored as ``holdout_set``; with ``kernels``
+    (from ``load_kernels``) nothing is fitted and every crop is scored
+    as ``holdout_set`` with the loaded kernels.
     """
+    if fit_samples is not None and kernels is not None:
+        raise ValueError("Give fit samples or kernels, not both.")
+    if settings["captures"] not in CAPTURE_SETS:
+        raise ValueError(f"captures must be one of {CAPTURE_SETS}.")
+    origins = tuple(settings["origins"])
+    if any(mode not in ORIGIN_MODES for mode in origins):
+        raise ValueError(f"origins must be among {ORIGIN_MODES}.")
     started = time.monotonic()
     prepared = prepare_all(samples, skipped, prepare, settings["scale_source"])
-    fitted = (
-        prepared
-        if fit_samples is None
-        else prepare_all(
+    sharpness = capture_sharpness(prepared)
+    fitted = prepared
+    if fit_samples is not None:
+        fitted = prepare_all(
             fit_samples, skipped, prepare, settings["scale_source"]
         )
-    )
+        sharpness.extend(capture_sharpness(fitted))
+    if settings["captures"] == "sharp":
+        prepared = keep_sharp(prepared, sharpness, skipped)
+        fitted = (
+            prepared
+            if fit_samples is None
+            else keep_sharp(fitted, sharpness, skipped)
+        )
     aligner = Aligner(settings["workers"])
     results: dict[str, CandidateResult] = {}
     try:
         for name in settings["candidates"]:
             candidate = CANDIDATES[name]
-            result = evaluate_candidate(
-                candidate,
-                fitted,
-                tuple(settings["holdouts"]) if fit_samples is None else (),
-                settings["iterations"],
-                aligner,
-                results.get(candidate.base),
-            )
-            if fit_samples is not None:
-                evaluation, composites = score_with_kernels(
+            if kernels is not None:
+                result = CandidateResult(candidate, {}, {})
+                scoring = kernels.get(name, {})
+            else:
+                result = evaluate_candidate(
                     candidate,
-                    prepared,
-                    result.evaluations["in_sample"].kernels,
+                    fitted,
+                    tuple(settings["holdouts"]) if fit_samples is None else (),
+                    settings["iterations"],
                     aligner,
+                    origins,
+                    results.get(candidate.base),
                 )
-                result.evaluations[evaluation.mode] = evaluation
+                scoring = result.evaluations["in_sample"].kernels
+            if fit_samples is not None or kernels is not None:
+                evaluations, composites = score_with_kernels(
+                    candidate, prepared, scoring, aligner, origins
+                )
+                for evaluation in evaluations:
+                    result.evaluations[evaluation.mode] = evaluation
                 result.composites = composites
             results[name] = result
             _print_progress(name, result, started)
@@ -760,7 +975,12 @@ def run_measured_kernel(
                 residual_dir / f"{sample_id}_{name}.png"
             )
     write_measured_report(
-        out_dir, list(results.values()), row_kinds(prepared), skipped, settings
+        out_dir,
+        list(results.values()),
+        row_kinds(prepared),
+        sharpness,
+        skipped,
+        settings,
     )
 
 
@@ -791,15 +1011,22 @@ def write_measured_report(
     out_dir: Path,
     results: list[CandidateResult],
     rows: list[RowKind],
+    sharpness: list[CaptureSharpness],
     skipped: list[Skipped],
     settings: dict,
 ) -> None:
-    """Write ``measured-kernel.json`` and ``measured-kernel.md``."""
+    """Write ``measured-kernel.json``, ``kernels.json`` and the report.
+
+    ``kernels.json`` holds the in-sample kernels alone, in the form
+    ``load_kernels`` reads back, so a later run can score with them.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "tool": "dnf_ocr_synth.calibration measured-kernel",
         "settings": settings,
         "gate_ratio": GATE_RATIO,
+        "sharpness_threshold": SHARP_MIN_PURE_BLACK_RATIO,
+        "captures": [asdict(entry) for entry in sharpness],
         "rows": [asdict(row) for row in rows],
         "candidates": [
             {
@@ -816,6 +1043,9 @@ def write_measured_report(
                             key: fitted.record()
                             for key, fitted in evaluation.kernels.items()
                         },
+                        "anchors": [
+                            asdict(anchor) for anchor in evaluation.anchors
+                        ],
                         "unevaluated": evaluation.unevaluated,
                         "fits": [
                             {**asdict(fit), "ratio": fit.ratio}
@@ -833,8 +1063,15 @@ def write_measured_report(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+    kernels = _kernels_payload(results, settings)
+    if kernels["candidates"]:
+        (out_dir / "kernels.json").write_text(
+            json.dumps(kernels, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
     (out_dir / "measured-kernel.md").write_text(
-        _markdown(results, rows, skipped, settings), encoding="utf-8"
+        _markdown(results, rows, sharpness, skipped, settings),
+        encoding="utf-8",
     )
 
 
@@ -852,6 +1089,7 @@ def _mode_columns(summary: GroupSummary | None) -> list[str]:
 def _markdown(
     results: list[CandidateResult],
     rows: list[RowKind],
+    sharpness: list[CaptureSharpness],
     skipped: list[Skipped],
     settings: dict,
 ) -> str:
@@ -873,7 +1111,16 @@ def _markdown(
         "# 측정 커널과 표준 필터 비교",
         "",
         "- 모든 후보가 같은 배경 추정, 같은 coverage 합성, 같은 가장 어두운 "
-        "채널 정렬 목적함수, 같은 x/y 서브픽셀 원점 탐색으로 채점됐다.",
+        "채널 정렬 목적함수, 같은 x/y 서브픽셀 원점 탐색으로 채점됐다. "
+        "합성은 crop 전체를 추정 배경 위에 그리므로 커널이 닿지 않는 곳에도 "
+        "원본 crop의 잉크는 남지 않는다.",
+        "- 채점 crop마다 원점을 다시 맞추는 것이 기본(fitted)이다. "
+        f"`{PREDICTED_SUFFIX}` 모드는 같은 캡처의 맞춘 원점에서 이름 칸 왼쪽, "
+        "1행 기준선, 가운데 정렬 반올림 방향 세 값만 취하고 각 행의 원점은 "
+        "layout(행 간격 21, 이름 칸 86 가운데 정렬)으로 예측해 다시 채점한다.",
+        "- 캡처 선명도는 가장 어두운 채널이 12 이하인 픽셀 가운데 0인 "
+        f"비율로, {SHARP_MIN_PURE_BLACK_RATIO} 미만이면 흐린 캡처다. "
+        f"채점 대상: {settings['captures']}.",
         "- 측정 커널(measured-*)은 음수 tap과 1을 넘는 coverage를 허용하고 "
         "넓이도 제약하지 않는다. `-unit`은 그 tap을 x, y 넓이 곱이 1이 "
         "되게 나눈 것이다. 표준 필터는 음수가 없고 넓이 1이며, `-gain`은 "
@@ -913,6 +1160,20 @@ def _markdown(
                 sections.append(
                     f"- {result.candidate.name} [{key}]: {fitted.describe()}"
                 )
+    sections.extend(["", "## 캡처 선명도", ""])
+    sections.append(
+        markdown_table(
+            ["캡처", "순흑 비율", "판정"],
+            [
+                [
+                    entry.case_id,
+                    f"{entry.ratio:.4f}",
+                    "선명" if entry.sharp else "흐림",
+                ]
+                for entry in sorted(sharpness, key=lambda entry: entry.case_id)
+            ],
+        )
+    )
     sections.extend(["", "## 행 분류", ""])
     sections.append(
         markdown_table(

@@ -7,7 +7,8 @@
     python -m dnf_ocr_synth.calibration raid-lines --crops index.json
         --originals originals/
     python -m dnf_ocr_synth.calibration phase --lines raid-lines.jsonl
-        --measured result/measured-kernel.json
+        --measured result/measured-kernel.json --crops index.json
+    python -m dnf_ocr_synth.calibration sharpness --crops index.json
 
 ``index.json`` and ``manifest.json`` follow dfragon's
 ``nickname-evaluation`` script, which writes crops as
@@ -37,12 +38,23 @@ from .align import (
     raid_fill_color,
     search_alignment,
 )
-from .layout import ADVANCE_MODES, raid_layout
+from .layout import (
+    ADVANCE_MODES,
+    RAID_HEADING_HEIGHT,
+    RAID_NAME_LEFT,
+    RAID_NAME_TOP,
+    RAID_NAME_WIDTH,
+    RAID_ROW_SPACING,
+    raid_layout,
+)
 from .measured import (
     CANDIDATES,
+    CAPTURE_SETS,
     DEFAULT_RESIDUALS,
     HOLDOUTS,
+    ORIGIN_MODES,
     SCALE_SOURCES,
+    load_kernels,
     run_measured_kernel,
 )
 from .metrics import (
@@ -66,6 +78,7 @@ from .report import (
     residual_image,
     write_report,
 )
+from .sharpness import is_sharp, pure_black_ratio
 
 
 def _require(mapping: dict, key: str, where: str):
@@ -145,10 +158,20 @@ def load_samples(
                 str(entry.get("capture", "")),
                 raids[case_id],
                 _theory_scale(entry),
+                _crop_origin(entry),
             )
         )
 
     return samples, skipped
+
+
+def _crop_origin(entry: dict) -> tuple[int, int] | None:
+    """Return the crop's top-left in the capture, if the entry says."""
+    crop = entry.get("crop")
+    if crop is None:
+        return None
+
+    return (int(crop["x"]), int(crop["y"]))
 
 
 def _theory_scale(entry: dict) -> float | None:
@@ -282,12 +305,35 @@ def _parse_measured(argv: list[str]) -> argparse.Namespace:
         "--fit-manifest", type=Path, help="Manifest of --fit-crops"
     )
     parser.add_argument(
+        "--kernels",
+        type=Path,
+        help=(
+            "Score every --crops crop with the kernels of this "
+            "kernels.json instead of fitting anything"
+        ),
+    )
+    parser.add_argument(
+        "--origins",
+        nargs="+",
+        choices=ORIGIN_MODES,
+        default=list(ORIGIN_MODES),
+        help="Origin modes to score (default: both)",
+    )
+    parser.add_argument(
+        "--captures",
+        choices=CAPTURE_SETS,
+        default="all",
+        help="Score every capture or only the sharp ones (default: all)",
+    )
+    parser.add_argument(
         "--workers", type=int, default=1, help="Alignment processes"
     )
     args = parser.parse_args(argv)
     args.color = _parse_color(parser, args.color)
     if (args.fit_crops is None) != (args.fit_manifest is None):
         parser.error("--fit-crops and --fit-manifest go together")
+    if args.kernels is not None and args.fit_crops is not None:
+        parser.error("--kernels and --fit-crops exclude each other")
     for name in args.residuals:
         if name not in args.candidates:
             parser.error(f"--residuals {name} is not among --candidates")
@@ -333,6 +379,8 @@ def run_measured(args: argparse.Namespace) -> None:
         "residuals": args.residuals,
         "iterations": args.iterations,
         "scale_source": args.scale_source,
+        "origins": args.origins,
+        "captures": args.captures,
         "workers": args.workers,
         "profile": args.profile,
         "color": "auto" if args.color is None else list(args.color),
@@ -340,6 +388,7 @@ def run_measured(args: argparse.Namespace) -> None:
         "crops": str(args.crops),
         "manifest": str(args.manifest),
         "fit_crops": None if args.fit_crops is None else str(args.fit_crops),
+        "kernels": None if args.kernels is None else str(args.kernels),
     }
     run_measured_kernel(
         args.out,
@@ -348,6 +397,7 @@ def run_measured(args: argparse.Namespace) -> None:
         lambda sample: _prepare_sample(args, renderer, sample),
         settings,
         fit_samples,
+        None if args.kernels is None else load_kernels(args.kernels),
     )
     print(args.out / "measured-kernel.md")
 
@@ -545,15 +595,6 @@ def run_hp_edge(args: argparse.Namespace) -> None:
     print(json.dumps(asdict(profile), ensure_ascii=False))
 
 
-# Raid window layout in native pixels, from dfragon's
-# dnf-raid-participants.ts: rows of 21px start under an 18px heading,
-# the name cell starts 182 right of the heading anchor and 3 below
-# its row, and a dark separator line runs along every row boundary.
-RAID_HEADING_HEIGHT = 18
-RAID_ROW_SPACING = 21
-RAID_NAME_LEFT = 182
-RAID_NAME_TOP = RAID_HEADING_HEIGHT + 3
-RAID_NAME_WIDTH = 86
 RAID_SEPARATOR_LINES = range(1, 12)
 LINE_SEARCH_ROWS = 2
 
@@ -710,12 +751,36 @@ def _parse_phase(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--lines", type=Path, required=True, help="raid-lines JSONL output"
     )
+    parser.add_argument(
+        "--crops",
+        type=Path,
+        required=True,
+        help="Crop index the origins were fitted on, for the crop offsets",
+    )
 
     return parser.parse_args(argv)
 
 
+def crop_origins(index: dict) -> dict[str, tuple[int, int]]:
+    """Map every crop id of ``index`` to its top-left in the capture."""
+    origins = {}
+    for position, entry in enumerate(_require(index, "crops", "crop index")):
+        where = f"crops[{position}]"
+        origin = _crop_origin(entry)
+        if origin is None:
+            raise ValueError(f"{where} lacks 'crop'.")
+        case_id = _require(entry, "caseId", where)
+        origins[f"{case_id}_slot{_require(entry, 'slot', where)}"] = origin
+
+    return origins
+
+
 def phase_table(
-    measured: dict, candidate: str, lines: list[dict], mode: str = "in_sample"
+    measured: dict,
+    candidate: str,
+    lines: list[dict],
+    crops: dict[str, tuple[int, int]],
+    mode: str = "in_sample",
 ) -> list[dict]:
     """Join each case's text-origin phases with its line-center phases.
 
@@ -724,7 +789,9 @@ def phase_table(
     of its center. ``row_scale`` and ``line_scale`` divide the span
     between the first and last origin or center by the native row
     spacing, an estimate of the scale that does not use the detected
-    one. Two captures of the same scale whose window moved together
+    one. The fitted origins are crop-relative, so ``crops`` (from
+    ``crop_origins``) moves them into the capture before the span is
+    taken. Two captures of the same scale whose window moved together
     show the same per-row and per-line phase shift.
     """
     entry = next(
@@ -739,7 +806,13 @@ def phase_table(
     origins: dict[str, dict[int, tuple[float, float]]] = defaultdict(dict)
     for fit in entry["evaluations"][mode]["fits"]:
         case_id, slot = fit["sample"].rsplit("_slot", 1)
-        origins[case_id][int(slot)] = tuple(fit["origin"])
+        if fit["sample"] not in crops:
+            raise ValueError(f"{fit['sample']} is not in the crop index.")
+        crop_x, crop_y = crops[fit["sample"]]
+        origins[case_id][int(slot)] = (
+            fit["origin"][0] + crop_x,
+            fit["origin"][1] + crop_y,
+        )
     rows = []
     for result in lines:
         case_id = result["caseId"]
@@ -797,7 +870,56 @@ def run_phase(args: argparse.Namespace) -> None:
         for line in args.lines.read_text(encoding="utf-8").splitlines()
         if line.strip() and "caseId" in line
     ]
-    for row in phase_table(measured, args.candidate, lines, args.mode):
+    crops = crop_origins(json.loads(args.crops.read_text(encoding="utf-8")))
+    rows = phase_table(measured, args.candidate, lines, crops, args.mode)
+    for row in rows:
+        print(json.dumps(row, ensure_ascii=False))
+
+
+def _parse_sharpness(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m dnf_ocr_synth.calibration sharpness",
+        description=(
+            "Classify every capture of a crop index as sharp or blurred "
+            "by the pure-black share of its crops."
+        ),
+    )
+    parser.add_argument("--crops", type=Path, required=True)
+
+    return parser.parse_args(argv)
+
+
+def capture_sharpness_table(index: dict, crops_dir: Path) -> list[dict]:
+    """Return one record per capture with its pure-black share."""
+    by_case: dict[str, list[np.ndarray]] = defaultdict(list)
+    scales = {}
+    for position, entry in enumerate(_require(index, "crops", "crop index")):
+        where = f"crops[{position}]"
+        case_id = _require(entry, "caseId", where)
+        by_case[case_id].append(
+            _load_crop(crops_dir / _require(entry, "file", where))
+        )
+        scales[case_id] = float(_require(entry, "scale", where))
+    rows = []
+    for case_id, crops in by_case.items():
+        ratio = pure_black_ratio(crops)
+        rows.append(
+            {
+                "caseId": case_id,
+                "scale": scales[case_id],
+                "crops": len(crops),
+                "pure_black_ratio": round(ratio, 4),
+                "sharp": is_sharp(ratio),
+            }
+        )
+
+    return rows
+
+
+def run_sharpness(args: argparse.Namespace) -> None:
+    """Print one JSON object per capture with its sharpness verdict."""
+    index = json.loads(args.crops.read_text(encoding="utf-8"))
+    for row in capture_sharpness_table(index, args.crops.parent):
         print(json.dumps(row, ensure_ascii=False))
 
 
@@ -811,6 +933,8 @@ def main(argv: list[str] | None = None) -> None:
             run_raid_lines(_parse_raid_lines(arguments[1:]))
         elif arguments[:1] == ["phase"]:
             run_phase(_parse_phase(arguments[1:]))
+        elif arguments[:1] == ["sharpness"]:
+            run_sharpness(_parse_sharpness(arguments[1:]))
         elif arguments[:1] == ["measured-kernel"]:
             run_measured(_parse_measured(arguments[1:]))
         else:
