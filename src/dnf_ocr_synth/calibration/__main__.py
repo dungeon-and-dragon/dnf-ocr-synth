@@ -31,6 +31,7 @@ from PIL import Image
 
 from ..fonts import FontPaths
 from ..render import COLOR, GlyphLayout, Renderer
+from ..scale_model import SCALE_MODELS, ScaleModel
 from .align import (
     SEARCH_RADIUS,
     best_candidate,
@@ -38,6 +39,7 @@ from .align import (
     raid_fill_color,
     search_alignment,
 )
+from .kernel import TAP_SPACING, KernelTaps
 from .layout import (
     ADVANCE_MODES,
     RAID_HEADING_HEIGHT,
@@ -54,6 +56,7 @@ from .measured import (
     HOLDOUTS,
     ORIGIN_MODES,
     SCALE_SOURCES,
+    FittedKernel,
     load_kernels,
     run_measured_kernel,
 )
@@ -79,6 +82,10 @@ from .report import (
     write_report,
 )
 from .sharpness import is_sharp, pure_black_ratio
+
+KERNEL_SCALE_MODELS = tuple(
+    name for name, model in SCALE_MODELS.items() if model.kernel is not None
+)
 
 
 def _require(mapping: dict, key: str, where: str):
@@ -313,6 +320,14 @@ def _parse_measured(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--scale-model",
+        choices=KERNEL_SCALE_MODELS,
+        help=(
+            "Score measured-native with this packaged scale model's "
+            "kernel instead of fitting anything"
+        ),
+    )
+    parser.add_argument(
         "--origins",
         nargs="+",
         choices=ORIGIN_MODES,
@@ -334,6 +349,11 @@ def _parse_measured(argv: list[str]) -> argparse.Namespace:
         parser.error("--fit-crops and --fit-manifest go together")
     if args.kernels is not None and args.fit_crops is not None:
         parser.error("--kernels and --fit-crops exclude each other")
+    if args.scale_model is not None:
+        if args.kernels is not None or args.fit_crops is not None:
+            parser.error("--scale-model excludes --kernels and --fit-crops")
+        if args.advance != "ink":
+            parser.error("--scale-model lays names out with --advance ink")
     for name in args.residuals:
         if name not in args.candidates:
             parser.error(f"--residuals {name} is not among --candidates")
@@ -389,6 +409,7 @@ def run_measured(args: argparse.Namespace) -> None:
         "manifest": str(args.manifest),
         "fit_crops": None if args.fit_crops is None else str(args.fit_crops),
         "kernels": None if args.kernels is None else str(args.kernels),
+        "scale_model": args.scale_model,
     }
     run_measured_kernel(
         args.out,
@@ -397,9 +418,36 @@ def run_measured(args: argparse.Namespace) -> None:
         lambda sample: _prepare_sample(args, renderer, sample),
         settings,
         fit_samples,
-        None if args.kernels is None else load_kernels(args.kernels),
+        _scoring_kernels(args),
     )
     print(args.out / "measured-kernel.md")
+
+
+def model_kernels(model: ScaleModel) -> dict[str, dict[str, FittedKernel]]:
+    """Return a kernel model's taps as the ``measured-native`` kernel.
+
+    The taps score every crop the way ``--kernels`` scores a loaded
+    ``kernels.json``; the scale only feeds the reported integrals,
+    which a native kernel does not depend on.
+    """
+    if model.kernel is None or model.kernel.spacing != TAP_SPACING["native"]:
+        raise ValueError(f"{model.name} has no native-unit kernel.")
+
+    taps = KernelTaps(model.kernel.x, model.kernel.y, "native")
+
+    return {"measured-native": {"all": FittedKernel(taps, 1.0)}}
+
+
+def _scoring_kernels(
+    args: argparse.Namespace,
+) -> dict[str, dict[str, FittedKernel]] | None:
+    if args.scale_model is not None:
+        return model_kernels(SCALE_MODELS[args.scale_model])
+
+    if args.kernels is not None:
+        return load_kernels(args.kernels)
+
+    return None
 
 
 def _parse_color(
