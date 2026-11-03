@@ -17,12 +17,31 @@ from dnf_ocr_synth.calibration.__main__ import (
     _parse_fit,
     load_samples,
     main,
+    raid_separator_profiles,
 )
 from dnf_ocr_synth.calibration.align import (
+    RAID_FILL_COLORS,
     best_candidate,
     estimate_text_origin,
+    nearest_fill_color,
     search_alignment,
 )
+from dnf_ocr_synth.calibration.kernel import (
+    KernelTaps,
+    align_sample,
+    estimate_kernel,
+    model_composite,
+    native_layers,
+    resample,
+    tap_basis,
+    tap_count,
+    tent_taps,
+)
+from dnf_ocr_synth.calibration.layout import (
+    ink_advance_layout,
+    layout_with_advance,
+)
+from dnf_ocr_synth.calibration.measured import run_measured_kernel
 from dnf_ocr_synth.calibration.metrics import (
     Reference,
     binarize_nickname_pixels,
@@ -31,6 +50,8 @@ from dnf_ocr_synth.calibration.metrics import (
     bt601_gray,
     compare,
     edge_profile,
+    line_profile,
+    line_width,
     otsu_threshold,
     remove_detached_raid_nickname_pixels,
     remove_raid_nickname_frame_lines,
@@ -49,7 +70,7 @@ from dnf_ocr_synth.calibration.report import (
     scale_bucket,
     write_report,
 )
-from dnf_ocr_synth.render import _colorize, _compose
+from dnf_ocr_synth.render import GlyphLayout, _colorize, _compose
 
 FIXTURES = Path(__file__).parent / "fixtures"
 COLOR = (75, 209, 255)
@@ -520,6 +541,358 @@ class EdgeProfileTests(unittest.TestCase):
             edge_profile(image, 0, 4, 1, window=3)
 
 
+class LineProfileTests(unittest.TestCase):
+    def test_crisp_two_row_line_measures_two_rows(self):
+        # Row means of an s=1 raid separator: two black rows with a
+        # brighter row under them than above.
+        self.assertAlmostEqual(
+            line_width([10, 29, 0, 0, 37, 21, 22]), 2.0, places=6
+        )
+
+    def test_scaled_line_measures_its_fractional_width(self):
+        # Half levels: 10 above (between 5 and 20) and 15 below
+        # (between 10 and 30), so 1 + 5/15 + 2 + 5/20 rows.
+        self.assertAlmostEqual(
+            line_width([20, 5, 0, 0, 10, 30, 20]), 3.5833333, places=6
+        )
+
+    def test_flat_profile_has_no_width(self):
+        self.assertTrue(math.isnan(line_width([5, 5, 5])))
+
+    def test_line_profile_averages_the_columns_of_the_band(self):
+        image = np.full((12, 20, 1), 40, dtype=np.uint8)
+        image[5:7, :, 0] = 0
+        image[5:7, 10:, 0] = 20
+        profile = line_profile(image, 0, 20, 5, window=3)
+        self.assertEqual(profile.rows, list(range(2, 9)))
+        self.assertEqual(profile.values[3:5], [10.0, 10.0])
+        self.assertAlmostEqual(profile.width_rows, 2.0, places=6)
+
+
+class RaidSeparatorTests(unittest.TestCase):
+    def test_measures_the_lines_under_the_name_column_of_each_case(self):
+        anchor = (100, 50)
+        image = np.full((400, 600, 3), 20, dtype=np.uint8)
+        for line in range(1, 12):
+            top = anchor[1] + 18 + 21 * line
+            image[top : top + 2] = 0
+            image[top + 2] = 40
+        with tempfile.TemporaryDirectory() as directory:
+            Image.fromarray(image, "RGB").save(Path(directory) / "case.png")
+            index = {
+                "crops": [
+                    {
+                        "caseId": "case",
+                        "slot": 1,
+                        "scale": 1,
+                        "crop": {"x": anchor[0] + 182, "y": anchor[1] + 21},
+                    },
+                    {"caseId": "case", "slot": 2},
+                ]
+            }
+            results = raid_separator_profiles(index, Path(directory), 3)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["caseId"], "case")
+        self.assertEqual(results[0]["values"][3:5], [0.0, 0.0])
+        self.assertAlmostEqual(results[0]["width_rows"], 2.0, places=6)
+
+
+class LayoutTests(unittest.TestCase):
+    def glyphs(self, names, widths, positions, advances):
+        masks = [Image.new("L", (width, 10), 255) for width in widths]
+
+        return GlyphLayout(names, masks, positions, advances)
+
+    def test_dotum_glyphs_start_at_the_cursor_and_advance_by_ink(self):
+        # Font advance 11 with bearings 1, 0, 1; the raid window packs
+        # each glyph at ink width + 1 instead.
+        glyphs = self.glyphs(
+            ["dotum"] * 3,
+            [8, 9, 10],
+            [(1, -9), (11, -9), (23, -9)],
+            [11, 11, 11],
+        )
+        spaced = ink_advance_layout(glyphs)
+        self.assertEqual(spaced.positions, [(0, -9), (9, -9), (19, -9)])
+        self.assertEqual(spaced.advances, [9, 10, 11])
+        self.assertIs(spaced.masks, glyphs.masks)
+
+    def test_other_faces_keep_their_bearing_and_advance(self):
+        glyphs = self.glyphs(
+            ["dotum", "dotumche", "dotum"],
+            [8, 5, 9],
+            [(1, -9), (11, -7), (18, -9)],
+            [11, 6, 11],
+        )
+        spaced = ink_advance_layout(glyphs)
+        self.assertEqual(spaced.positions, [(0, -9), (9, -7), (15, -9)])
+        self.assertEqual(spaced.advances, [9, 6, 10])
+
+    def test_font_mode_keeps_the_renderer_layout(self):
+        glyphs = self.glyphs(["dotum"], [8], [(1, -9)], [11])
+        self.assertIs(layout_with_advance(glyphs, "font"), glyphs)
+        self.assertEqual(
+            layout_with_advance(glyphs, "ink").positions, [(0, -9)]
+        )
+        with self.assertRaises(ValueError):
+            layout_with_advance(glyphs, "metrics")
+
+
+def trapezoid_taps():
+    # Flat to 0.5 crop px, then linear to zero at 1.5 crop px.
+    values = tuple(
+        max(0.0, min(1.0, (1.5 - distance) / 1.0))
+        for distance in (index * 0.25 for index in range(tap_count()))
+    )
+
+    return KernelTaps(values, values)
+
+
+def kernel_crop(glyphs, scale, origin, taps, size, fill_value=146, bg=20):
+    fill, alpha = native_layers(glyphs)
+    coverage, filled = resample(fill, alpha, scale, origin, taps, size)
+    darkest = np.clip(bg * (1 - coverage) + fill_value * filled, 0, 255)
+    rgba = np.zeros((*size, 4), dtype=np.uint8)
+    rgba[..., :3] = np.rint(darkest)[..., None]
+    rgba[..., 3] = 255
+
+    return rgba
+
+
+class KernelTests(unittest.TestCase):
+    def test_tap_basis_interpolates_between_neighboring_taps(self):
+        basis = tap_basis(np.array([0.1, -0.1, 0.25, 4.5]))
+        self.assertAlmostEqual(basis[0, 0], 0.6)
+        self.assertAlmostEqual(basis[0, 1], 0.4)
+        np.testing.assert_allclose(basis[1], basis[0])
+        self.assertAlmostEqual(basis[2, 1], 1.0)
+        self.assertEqual(basis[3].sum(), 0.0)
+        distances = np.linspace(-3, 3, 25)
+        np.testing.assert_allclose(
+            tap_basis(distances) @ np.array(tent_taps(2.0).x),
+            np.maximum(0, 1 - np.abs(distances) / 2.0),
+        )
+
+    def test_native_layers_pad_by_two_and_outline_by_one(self):
+        mask = Image.new("L", (1, 2), 255)
+        fill, alpha = native_layers(
+            GlyphLayout(["dotum"], [mask], [(0, 0)], [2])
+        )
+        self.assertEqual(fill.shape, (6, 5))
+        self.assertEqual(
+            ink_rows(np.where(fill, 0, 255)[..., None].repeat(4, 2)),
+            [".....", ".....", "..#..", "..#..", ".....", "....."],
+        )
+        self.assertEqual(
+            ink_rows(np.where(alpha, 0, 255)[..., None].repeat(4, 2)),
+            [".....", ".###.", ".###.", ".###.", ".###.", "....."],
+        )
+
+    def test_box_taps_double_a_pixel_at_scale_two(self):
+        box = KernelTaps((1.0, 1.0, 1.0, 1.0) + (0.0,) * (tap_count() - 4), ())
+        fill = np.ones((1, 1), dtype=bool)
+        coverage, filled = resample(
+            fill, fill, 2.0, (1.0, 1.0), KernelTaps(box.x, box.x), (4, 4)
+        )
+        expected = np.zeros((4, 4))
+        expected[1:3, 1:3] = 1
+        np.testing.assert_allclose(coverage, expected)
+        np.testing.assert_allclose(filled, expected)
+
+    def test_model_composite_blends_coverage_over_the_background(self):
+        crop = np.full((1, 4, 4), 255, dtype=np.uint8)
+        crop[0, :, :3] = 20
+        reference = Reference.from_rgba(crop, 1.0, "raid")
+        coverage = np.array([[0.0, 0.5, 1.0, 1.1]])
+        filled = np.array([[0.0, 0.25, 1.0, 1.1]])
+        composite, covered = model_composite(
+            reference, coverage, filled, (200, 100, 50)
+        )
+        self.assertEqual(covered.tolist(), [[False, True, True, True]])
+        self.assertEqual(composite[0, 0, :3].tolist(), [20, 20, 20])
+        self.assertEqual(composite[0, 1, :3].tolist(), [60, 35, 22])
+        self.assertEqual(composite[0, 2, :3].tolist(), [200, 100, 50])
+        # Overshoot is kept, not clipped to the fill color.
+        self.assertEqual(composite[0, 3, :3].tolist(), [218, 108, 53])
+
+    def test_alignment_and_estimation_recover_a_known_kernel(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        taps = trapezoid_taps()
+        scale = 1.8
+        crops = [
+            kernel_crop(glyphs, scale, origin, taps, (34, 48))
+            for origin in ((3.3, 2.1), (7.0, 4.6))
+        ]
+        references = [
+            Reference.from_rgba(crop, scale, "raid") for crop in crops
+        ]
+        # The bilinear start misplaces by a tenth of a pixel, and the
+        # second pass with the first estimate settles the placement.
+        estimated = None
+        for _ in range(2):
+            samples = [
+                align_sample(reference, glyphs, 146, scale, estimated)
+                for reference in references
+            ]
+            estimated = estimate_kernel(samples, scale)
+        for sample, origin in zip(samples, ((3.3, 2.1), (7.0, 4.6))):
+            self.assertAlmostEqual(sample.origin[0], origin[0], delta=0.03)
+            self.assertAlmostEqual(sample.origin[1], origin[1], delta=0.03)
+        for sample in samples:
+            modeled, _ = sample.model(estimated)
+            crop_dark = sample.reference.rgba[..., 0].astype(float)
+            self.assertLess(np.abs(modeled - crop_dark).max(), 4.0)
+        # The axis gains trade off against each other, so compare the
+        # geometric mean of the x and y taps where the kernel is wide.
+        recovered = np.sqrt(
+            np.array(estimated.x[:7]) * np.array(estimated.y[:7])
+        )
+        np.testing.assert_allclose(recovered, taps.x[:7], atol=0.05)
+        # A separable fit fixes only the product of the axis gains, and
+        # the trapezoid integrates to 2 crop px, 1.111 source px.
+        self.assertAlmostEqual(
+            estimated.integral("x", scale) * estimated.integral("y", scale),
+            1.111**2,
+            delta=0.05,
+        )
+
+    def test_layers_larger_than_the_crop_are_rejected(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        tiny = Reference.from_rgba(
+            np.full((8, 8, 4), 255, dtype=np.uint8), 1.0, "raid"
+        )
+        with self.assertRaises(ValueError):
+            align_sample(tiny, glyphs, 146, 1.0)
+
+
+class MeasuredKernelTests(unittest.TestCase):
+    def sample_info(self, sample_id, scale):
+        return SampleInfo(
+            sample_id, "c", "raid", 1, f"{sample_id}.png", scale, "가", 0, ""
+        )
+
+    def test_bucket_without_plain_rows_is_skipped_and_reported(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        crop = kernel_crop(glyphs, 1.5, (3.0, 2.0), trapezoid_taps(), (30, 40))
+        reference = Reference.from_rgba(crop, 1.5, "raid")
+        yellow = RAID_FILL_COLORS["yellow"]
+        skipped = []
+        with tempfile.TemporaryDirectory() as directory:
+            run_measured_kernel(
+                Path(directory),
+                [self.sample_info("y1", 1.5)],
+                skipped,
+                lambda sample: (glyphs, reference, yellow),
+                1,
+                {"iterations": 1},
+            )
+            payload = json.loads(
+                (Path(directory) / "measured-kernel.json").read_text("utf-8")
+            )
+        self.assertEqual(payload["buckets"], [])
+        self.assertEqual([entry.sample for entry in skipped], ["y1"])
+        self.assertIn("1.5", skipped[0].reason)
+
+    def test_plain_rows_fit_the_bucket_and_every_row_is_scored(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        taps = trapezoid_taps()
+        beige = RAID_FILL_COLORS["beige"]
+        yellow = RAID_FILL_COLORS["yellow"]
+        # Two plain rows at different sub-pixel phases pin the kernel
+        # down; the own-party row shares a phase and is only scored.
+        references = {
+            "b1": (
+                Reference.from_rgba(
+                    kernel_crop(glyphs, 1.8, (3.3, 2.1), taps, (34, 48)),
+                    1.8,
+                    "raid",
+                ),
+                beige,
+            ),
+            "b2": (
+                Reference.from_rgba(
+                    kernel_crop(glyphs, 1.8, (7.0, 4.6), taps, (34, 48)),
+                    1.8,
+                    "raid",
+                ),
+                beige,
+            ),
+            "y1": (
+                Reference.from_rgba(
+                    kernel_crop(glyphs, 1.8, (3.3, 2.1), taps, (34, 48)),
+                    1.8,
+                    "raid",
+                ),
+                yellow,
+            ),
+        }
+        skipped = []
+        with tempfile.TemporaryDirectory() as directory:
+            run_measured_kernel(
+                Path(directory),
+                [self.sample_info(name, 1.8) for name in ("b1", "b2", "y1")],
+                skipped,
+                lambda sample: (glyphs, *references[sample.id]),
+                2,
+                {"iterations": 2},
+            )
+            payload = json.loads(
+                (Path(directory) / "measured-kernel.json").read_text("utf-8")
+            )
+            report = (Path(directory) / "measured-kernel.md").read_text(
+                "utf-8"
+            )
+            residuals = sorted(
+                path.name for path in (Path(directory) / "residual").iterdir()
+            )
+        self.assertEqual(skipped, [])
+        (bucket,) = payload["buckets"]
+        self.assertEqual(bucket["bucket"], "1.8")
+        self.assertEqual(bucket["estimation_samples"], 2)
+        self.assertEqual(
+            [(fit["sample"], fit["estimated_from"]) for fit in bucket["fits"]],
+            [("b1", True), ("b2", True), ("y1", False)],
+        )
+        self.assertEqual(bucket["mismatch"], 0)
+        self.assertIn("| 1.8 | 3 | 2 |", report)
+        self.assertEqual(
+            residuals,
+            [
+                "b1_measured-kernel.png",
+                "b2_measured-kernel.png",
+                "y1_measured-kernel.png",
+            ],
+        )
+
+
+class FillColorTests(unittest.TestCase):
+    def crop(self, bright):
+        rgba = np.zeros((4, 6, 4), dtype=np.uint8)
+        rgba[..., :3] = 20
+        rgba[..., 3] = 255
+        rgba[1:3, 1:5, :3] = bright
+
+        return rgba
+
+    def test_blended_fill_still_picks_its_palette_entry(self):
+        self.assertEqual(
+            nearest_fill_color(self.crop((240, 235, 140))),
+            RAID_FILL_COLORS["yellow"],
+        )
+        self.assertEqual(
+            nearest_fill_color(self.crop((200, 185, 135))),
+            RAID_FILL_COLORS["beige"],
+        )
+
+    def test_crop_without_bright_pixels_is_an_error(self):
+        with self.assertRaises(ValueError):
+            nearest_fill_color(self.crop((90, 90, 90)))
+
+
 class ReportTests(unittest.TestCase):
     def test_scale_buckets_follow_the_evaluation_script(self):
         self.assertEqual(scale_bucket(1.28), "1.2")
@@ -704,6 +1077,19 @@ class SampleLoadingTests(unittest.TestCase):
         required = ["--crops", "i.json", "--manifest", "m.json", "--out", "o"]
         self.assertTrue(_parse_fit(required).outlined)
         self.assertFalse(_parse_fit([*required, "--outline-px", "0"]).outlined)
+
+    def test_color_takes_a_triple_or_auto_and_advance_defaults_to_ink(self):
+        required = ["--crops", "i.json", "--manifest", "m.json", "--out", "o"]
+        self.assertEqual(_parse_fit(required).color, (75, 209, 255))
+        self.assertEqual(_parse_fit(required).advance, "ink")
+        self.assertIsNone(_parse_fit([*required, "--color", "auto"]).color)
+        self.assertEqual(
+            _parse_fit([*required, "--color", "1", "2", "3"]).color, (1, 2, 3)
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            for bad in (["1", "2"], ["1", "2", "256"], ["auto", "1"]):
+                with self.assertRaises(SystemExit):
+                    _parse_fit([*required, "--color", *bad])
 
     def test_cli_reports_input_errors_with_exit_code_2(self):
         with tempfile.TemporaryDirectory() as directory:
