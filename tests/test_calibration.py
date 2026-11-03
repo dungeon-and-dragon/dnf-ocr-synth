@@ -23,6 +23,7 @@ from dnf_ocr_synth.calibration.__main__ import (
     line_width_fit,
     load_samples,
     main,
+    model_kernels,
     phase_table,
     raid_separator_profiles,
 )
@@ -91,6 +92,11 @@ from dnf_ocr_synth.calibration.report import (
 from dnf_ocr_synth.calibration.sharpness import is_sharp, pure_black_ratio
 from dnf_ocr_synth.fonts import FontPaths
 from dnf_ocr_synth.render import GlyphLayout, Renderer, _colorize, _compose
+from dnf_ocr_synth.scale_model import (
+    AFFINE_BILINEAR,
+    CALIBRATED_V1,
+    resample_layers,
+)
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GULIM = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts/gulim.ttc"
@@ -2005,3 +2011,115 @@ class MeasuredKernelContractTests(MeasuredKernelCase):
             self.run_measured(
                 infos, references, measured_settings(captures="crisp")
             )
+
+
+def calibrated_taps():
+    return KernelTaps(CALIBRATED_V1.kernel.x, CALIBRATED_V1.kernel.y, "native")
+
+
+def kernel_padded_layers(glyphs):
+    # The renderer pads by 3 native px, one more than native_layers.
+    fill, alpha = native_layers(glyphs)
+
+    return np.pad(fill, 1), np.pad(alpha, 1)
+
+
+class CalibratedModelTests(unittest.TestCase):
+    def test_renderer_resampling_matches_the_calibration_kernel(self):
+        masks, positions = synthetic_layout()
+        fill, alpha = kernel_padded_layers(
+            GlyphLayout(["dotum"] * 2, masks, positions, [8, 5])
+        )
+        for scale in (1.0733, 1.37, 1.8):
+            with self.subTest(scale=scale):
+                size = (
+                    math.ceil(fill.shape[0] * scale),
+                    math.ceil(fill.shape[1] * scale),
+                )
+                expected = resample(
+                    fill, alpha, scale, (0.0, 0.0), calibrated_taps(), size
+                )
+                actual = resample_layers(
+                    [
+                        alpha.astype(float).tolist(),
+                        fill.astype(float).tolist(),
+                    ],
+                    scale,
+                    CALIBRATED_V1.kernel,
+                    size[::-1],
+                )
+                for want, got in zip(expected, actual):
+                    np.testing.assert_allclose(np.array(got), want, atol=1e-12)
+
+    @unittest.skipUnless(GULIM.is_file(), "Local Windows font unavailable")
+    def test_calibrated_render_composites_like_the_calibration_model(self):
+        renderer = Renderer(FontPaths(gulim=GULIM))
+        text = "가나12다!"
+        for scale in (1.0733, 1.8):
+            with self.subTest(scale=scale):
+                sample = renderer.render(
+                    text, scale=scale, color=COLOR, scale_model="calibrated-v1"
+                )
+                fill, alpha = kernel_padded_layers(
+                    raid_layout(renderer, text, "dotum", "ink")
+                )
+                rgba = np.asarray(sample.image).astype(np.float64)
+                coverage, filled = resample(
+                    fill,
+                    alpha,
+                    scale,
+                    (0.0, 0.0),
+                    calibrated_taps(),
+                    rgba.shape[:2],
+                )
+                background = band_background(*sample.image.size)[..., :3]
+                expected = np.clip(
+                    background * (1 - coverage[..., None])
+                    + np.array(COLOR) * filled[..., None],
+                    0,
+                    255,
+                )
+                opacity = rgba[..., 3:] / 255
+                actual = background * (1 - opacity) + rgba[..., :3] * opacity
+                # RGBA holds coverage in [0, 1] with non-negative fill
+                # under it, so it clips the measured kernel's overshoot
+                # and negative lobes; elsewhere only rounding differs.
+                clipped = (
+                    background.max(axis=2) * np.maximum(coverage - 1, 0)
+                    + 255 * np.maximum(-filled, 0)
+                    + 255 * np.maximum(filled - coverage, 0)
+                    + 255 * np.maximum(-coverage, 0)
+                )
+                difference = np.abs(actual - expected).max(axis=2)
+                self.assertTrue((clipped == 0).any())
+                self.assertLessEqual(difference[clipped == 0].max(), 2.0)
+                self.assertTrue((difference <= clipped + 2.0).all())
+
+    def test_scale_model_scores_with_the_packaged_kernel(self):
+        required = ["--crops", "i.json", "--manifest", "m.json", "--out", "o"]
+        self.assertIsNone(_parse_measured(required).scale_model)
+        args = _parse_measured([*required, "--scale-model", "calibrated-v1"])
+        self.assertEqual(args.scale_model, "calibrated-v1")
+        with contextlib.redirect_stderr(io.StringIO()):
+            for extra in (
+                ["--kernels", "k.json"],
+                ["--advance", "font"],
+            ):
+                with self.subTest(extra=extra):
+                    with self.assertRaises(SystemExit):
+                        _parse_measured(
+                            [
+                                *required,
+                                "--scale-model",
+                                "calibrated-v1",
+                                *extra,
+                            ]
+                        )
+            with self.assertRaises(SystemExit):
+                _parse_measured(
+                    [*required, "--scale-model", "affine-bilinear"]
+                )
+        fitted = model_kernels(CALIBRATED_V1)["measured-native"]["all"]
+        self.assertEqual(fitted.kernel, calibrated_taps())
+        with self.assertRaises(ValueError):
+            model_kernels(AFFINE_BILINEAR)
