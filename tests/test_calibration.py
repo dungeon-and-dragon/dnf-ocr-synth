@@ -18,6 +18,8 @@ except ImportError:  # pragma: no cover - the calib extra is optional
 from dnf_ocr_synth.calibration.__main__ import (
     _parse_fit,
     _parse_measured,
+    capture_sharpness_table,
+    crop_origins,
     line_width_fit,
     load_samples,
     main,
@@ -47,10 +49,13 @@ from dnf_ocr_synth.calibration.kernel import (
     tent_taps,
 )
 from dnf_ocr_synth.calibration.layout import (
+    cell_offset,
     ink_advance_layout,
     raid_layout,
+    text_box,
 )
 from dnf_ocr_synth.calibration.measured import (
+    load_kernels,
     run_measured_kernel,
 )
 from dnf_ocr_synth.calibration.metrics import (
@@ -68,6 +73,7 @@ from dnf_ocr_synth.calibration.metrics import (
     remove_detached_raid_nickname_pixels,
     remove_raid_nickname_frame_lines,
 )
+from dnf_ocr_synth.calibration.origins import Placement, predict_origins
 from dnf_ocr_synth.calibration.pipelines import (
     DEFAULT_PIPELINE,
     ScalePipeline,
@@ -82,6 +88,7 @@ from dnf_ocr_synth.calibration.report import (
     scale_bucket,
     write_report,
 )
+from dnf_ocr_synth.calibration.sharpness import is_sharp, pure_black_ratio
 from dnf_ocr_synth.fonts import FontPaths
 from dnf_ocr_synth.render import GlyphLayout, Renderer, _colorize, _compose
 
@@ -703,6 +710,32 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(spaced.positions, [(0, -9), (9, -7)])
         self.assertEqual(spaced.advances, [9, 3])
 
+    def test_non_ascii_symbols_sit_one_row_lower_at_the_cursor(self):
+        # Dotum's heart has bearing 1 and advance 9; the raid window
+        # draws it at the cursor one row down and advances ink + 1,
+        # while the Hangul after it keeps its own rule.
+        glyphs = self.glyphs(
+            ["dotum", "dotum"], [7, 8], [(1, -9), (10, -9)], [9, 11]
+        )
+        spaced = ink_advance_layout("♥가", glyphs, no_symbols)
+        self.assertEqual(spaced.names, ["dotum", "dotum"])
+        self.assertEqual(spaced.positions, [(0, -8), (8, -9)])
+        self.assertEqual(spaced.advances, [8, 9])
+
+    def test_text_box_spans_every_glyph_from_the_lowest_position(self):
+        glyphs = self.glyphs(
+            ["dotum", "dotum"], [7, 8], [(1, -8), (8, -9)], [8, 9]
+        )
+        self.assertEqual(text_box(glyphs), (1, -9, 15))
+
+    def test_cell_offset_centers_in_86_and_rounds_the_half_as_told(self):
+        self.assertEqual(cell_offset(48, "up"), 19)
+        self.assertEqual(cell_offset(48, "down"), 19)
+        self.assertEqual(cell_offset(47, "up"), 20)
+        self.assertEqual(cell_offset(47, "down"), 19)
+        with self.assertRaises(ValueError):
+            cell_offset(47, "nearest")
+
     def test_advance_option_accepts_ink_and_font(self):
         required = ["--crops", "i.json", "--manifest", "m.json", "--out", "o"]
         self.assertEqual(_parse_measured(required).advance, "ink")
@@ -730,6 +763,10 @@ class RaidLayoutTests(unittest.TestCase):
             ["#", "#", "#", "#", "#", ".", "#", "#"],
         )
         self.assertEqual(ink.positions[2], (ink.advances[0] + 2, -4))
+        heart = raid_layout(renderer, "♥가", "dotum", "ink")
+        self.assertEqual(heart.names, ["dotum", "dotum"])
+        self.assertEqual(heart.masks[0].size, (7, 8))
+        self.assertEqual(heart.positions, [(0, -8), (8, -9)])
         font = raid_layout(renderer, "앞!-", "dotum", "font")
         self.assertEqual(font.names, ["dotum", "dotum", "dotum"])
         self.assertEqual(font.positions, renderer.layout("앞!-").positions)
@@ -872,6 +909,25 @@ class KernelTests(unittest.TestCase):
         # Overshoot is kept, not clipped to the fill color.
         self.assertEqual(composite[0, 3, :3].tolist(), [218, 108, 53])
 
+    def test_model_composite_leaves_no_crop_ink_outside_the_coverage(self):
+        # The crop's own bright text at the left edge is inpainted out
+        # of the background; a kernel that does not reach it must not
+        # keep it.
+        crop = np.full((1, 6, 4), 255, dtype=np.uint8)
+        crop[0, :, :3] = 20
+        crop[0, 0, :3] = 200
+        reference = Reference.from_rgba(crop, 1.0, "raid")
+        self.assertEqual(reference.ink.tolist(), [[True] + [False] * 5])
+        coverage = np.zeros((1, 6))
+        coverage[0, 4] = 1.0
+        filled = coverage.copy()
+        composite, covered = model_composite(
+            reference, coverage, filled, (200, 100, 50)
+        )
+        self.assertEqual(covered.tolist(), [[False] * 4 + [True, False]])
+        self.assertEqual(composite[0, 0, :3].tolist(), [20, 20, 20])
+        self.assertEqual(composite[0, 4, :3].tolist(), [200, 100, 50])
+
     def test_alignment_and_estimation_recover_a_known_kernel(self):
         masks, positions = synthetic_layout()
         glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
@@ -963,6 +1019,8 @@ def measured_settings(**overrides):
         "residuals": ["measured-bucket"],
         "iterations": 2,
         "scale_source": "detected",
+        "origins": ["fitted"],
+        "captures": "all",
         "workers": 1,
     }
     settings.update(overrides)
@@ -970,13 +1028,15 @@ def measured_settings(**overrides):
     return settings
 
 
-class MeasuredKernelTests(unittest.TestCase):
-    def sample_info(self, sample_id, scale, case_id="c", raid="A"):
+class MeasuredKernelCase(unittest.TestCase):
+    def sample_info(
+        self, sample_id, scale, case_id="c", raid="A", slot=1, crop=None
+    ):
         return SampleInfo(
             sample_id,
             case_id,
             "raid",
-            1,
+            slot,
             f"{sample_id}.png",
             scale,
             "가",
@@ -984,6 +1044,7 @@ class MeasuredKernelTests(unittest.TestCase):
             "",
             raid,
             scale,
+            crop,
         )
 
     def run_measured(self, infos, references, settings):
@@ -1023,6 +1084,8 @@ class MeasuredKernelTests(unittest.TestCase):
             for name, (scale, origin, color) in placements.items()
         }
 
+
+class MeasuredKernelTests(MeasuredKernelCase):
     def test_bucket_without_plain_rows_is_left_unevaluated(self):
         masks, positions = synthetic_layout()
         glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
@@ -1376,7 +1439,10 @@ class SampleLoadingTests(unittest.TestCase):
                     crop_entry("c1", "party", 1),
                     crop_entry("c1", "party", 2),
                     crop_entry("c1", "party", 3),
-                    crop_entry("r1", "raid", 12),
+                    {
+                        **crop_entry("r1", "raid", 12),
+                        "crop": {"x": 333, "y": 304, "width": 116},
+                    },
                 ]
             }
         if manifest is None:
@@ -1422,6 +1488,9 @@ class SampleLoadingTests(unittest.TestCase):
             self.assertEqual(
                 [s.id for s in included],
                 ["c1_slot1", "c1_slot2", "r1_slot12"],
+            )
+            self.assertEqual(
+                [s.crop_origin for s in samples], [None, (333, 304)]
             )
 
     def test_missing_keys_are_reported(self):
@@ -1482,6 +1551,30 @@ class SampleLoadingTests(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     _parse_fit([*required, "--color", *bad])
 
+    def test_measured_options_default_to_both_origins_and_all_captures(self):
+        required = ["--crops", "i.json", "--manifest", "m.json", "--out", "o"]
+        args = _parse_measured(required)
+        self.assertEqual(args.origins, ["fitted", "predicted"])
+        self.assertEqual(args.captures, "all")
+        self.assertIsNone(args.kernels)
+        args = _parse_measured(
+            [*required, "--origins", "fitted", "--captures", "sharp"]
+        )
+        self.assertEqual((args.origins, args.captures), (["fitted"], "sharp"))
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                _parse_measured(
+                    [
+                        *required,
+                        "--kernels",
+                        "k.json",
+                        "--fit-crops",
+                        "f.json",
+                        "--fit-manifest",
+                        "f-m.json",
+                    ]
+                )
+
     def test_cli_reports_input_errors_with_exit_code_2(self):
         with tempfile.TemporaryDirectory() as directory:
             with (
@@ -1503,8 +1596,10 @@ class SampleLoadingTests(unittest.TestCase):
 
 class PhaseTests(unittest.TestCase):
     def test_phase_table_lists_row_and_line_phases_and_implied_scales(self):
-        # Rows 1 and 12 are 231 native rows apart; origins 300.3 rows
-        # apart imply s=1.3, and so do line centers 1 to 11.
+        # Rows 1 and 12 are 231 native rows apart. Each fitted origin
+        # is a few px inside its own crop, so only with the crop
+        # offsets (300 rows apart) do the origins land 300.3 rows apart
+        # and imply s=1.3, as the line centers 1 to 11 do.
         measured = {
             "candidates": [
                 {
@@ -1515,7 +1610,7 @@ class PhaseTests(unittest.TestCase):
                                 {"sample": "c1_slot1", "origin": [12.25, 3.5]},
                                 {
                                     "sample": "c1_slot12",
-                                    "origin": [12.5, 303.8],
+                                    "origin": [12.5, 3.8],
                                 },
                                 {"sample": "c2_slot1", "origin": [2.0, 1.0]},
                             ]
@@ -1523,6 +1618,11 @@ class PhaseTests(unittest.TestCase):
                     },
                 }
             ]
+        }
+        crops = {
+            "c1_slot1": (100, 40),
+            "c1_slot12": (100, 340),
+            "c2_slot1": (0, 0),
         }
         lines = [
             {
@@ -1540,13 +1640,368 @@ class PhaseTests(unittest.TestCase):
                 "lines": [{"line": 1, "center_row": 1.0}],
             },
         ]
-        rows = phase_table(measured, "measured-bucket", lines)
+        rows = phase_table(measured, "measured-bucket", lines, crops)
         self.assertEqual([row["caseId"] for row in rows], ["c1"])
         self.assertEqual(rows[0]["rows"], {"1": [0.25, 0.5], "12": [0.5, 0.8]})
         self.assertEqual(rows[0]["lines"], {"1": 0.75, "11": 0.75})
         self.assertAlmostEqual(rows[0]["row_scale"], 1.3, places=4)
         self.assertAlmostEqual(rows[0]["line_scale"], 1.3, places=4)
         with self.assertRaises(ValueError):
-            phase_table(measured, "bilinear", lines)
+            phase_table(measured, "bilinear", lines, crops)
         with self.assertRaises(ValueError):
-            phase_table(measured, "measured-bucket", lines, "holdout_set")
+            phase_table(
+                measured, "measured-bucket", lines, crops, "holdout_set"
+            )
+        with self.assertRaisesRegex(ValueError, "c1_slot1"):
+            phase_table(measured, "measured-bucket", lines, {})
+
+    def test_crop_origins_read_every_entry_and_need_the_crop_box(self):
+        entry = {
+            **crop_entry("c1", "raid", 3),
+            "crop": {"x": 333, "y": 361, "width": 116, "height": 23},
+        }
+        self.assertEqual(
+            crop_origins({"crops": [entry]}), {"c1_slot3": (333, 361)}
+        )
+        with self.assertRaisesRegex(ValueError, "crop"):
+            crop_origins({"crops": [crop_entry("c1", "raid", 3)]})
+
+
+class SharpnessTests(unittest.TestCase):
+    def crops(self, outline):
+        # Six outline pixels per crop at ``outline``, the rest a dark
+        # background at 10, which the near-black count also takes.
+        crop = np.full((4, 8, 4), 255, dtype=np.uint8)
+        crop[..., :3] = 10
+        crop[1, 1:7, :3] = outline
+
+        return [crop, crop.copy()]
+
+    def test_sharp_captures_keep_exact_black_and_blurred_ones_do_not(self):
+        # 12 of 64 near-black pixels are exactly 0 on the sharp crops.
+        sharp = pure_black_ratio(self.crops(0))
+        self.assertAlmostEqual(sharp, 12 / 64)
+        self.assertTrue(is_sharp(sharp))
+        blurred = pure_black_ratio(self.crops(3))
+        self.assertEqual(blurred, 0.0)
+        self.assertFalse(is_sharp(blurred))
+        with self.assertRaises(ValueError):
+            pure_black_ratio([np.full((2, 2, 4), 200, dtype=np.uint8)])
+
+    def test_sharpness_table_groups_the_crops_of_each_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            entries = []
+            for case_id, outline in (("s1", 0), ("b1", 3)):
+                for slot, crop in enumerate(self.crops(outline), 1):
+                    name = f"{case_id}_slot{slot}.png"
+                    Image.fromarray(crop, "RGBA").save(Path(directory) / name)
+                    entries.append(
+                        {
+                            "caseId": case_id,
+                            "slot": slot,
+                            "file": name,
+                            "scale": 1.5,
+                        }
+                    )
+            table = capture_sharpness_table(
+                {"crops": entries}, Path(directory)
+            )
+        self.assertEqual(
+            [(row["caseId"], row["crops"], row["sharp"]) for row in table],
+            [("s1", 2, True), ("b1", 2, False)],
+        )
+        self.assertAlmostEqual(table[0]["pure_black_ratio"], 0.1875)
+
+
+class PredictedOriginTests(unittest.TestCase):
+    def placement(self, sample, case_id, slot, scale, crop, box, origin):
+        return Placement(sample, case_id, slot, scale, crop, box, origin)
+
+    def test_origins_follow_the_capture_anchor_and_odd_rows_rounding(self):
+        # Capture c1 at s=1.6: the cell's left edge sits at capture x
+        # 1000.0 and row 1's baseline at y 500.0. The 48 px text starts
+        # 19 px in; the 47 px text starts 19 px in too, so the capture
+        # rounds its half down, and row 3 sits 42 native rows lower.
+        scale = 1.6
+        rows = [
+            ("c1_slot1", 1, (900, 470), (0, -10, 48), 19),
+            ("c1_slot3", 3, (900, 470 + 67), (0, -9, 47), 19),
+            ("c1_slot5", 5, (900, 470 + 134), (1, -10, 48), 19),
+        ]
+        placements = []
+        expected = {}
+        for sample, slot, crop, box, offset in rows:
+            ink_left = 1000.0 + scale * offset
+            baseline = 500.0 + scale * 21 * (slot - 1)
+            origin = (
+                ink_left - 2 * scale - crop[0],
+                baseline - scale * (2 - box[1]) - crop[1],
+            )
+            expected[sample] = origin
+            placements.append(
+                self.placement(sample, "c1", slot, scale, crop, box, origin)
+            )
+        origins, anchors = predict_origins(placements)
+        self.assertEqual(len(anchors), 1)
+        self.assertEqual(anchors[0].case_id, "c1")
+        self.assertAlmostEqual(anchors[0].cell_left, 1000.0)
+        self.assertAlmostEqual(anchors[0].first_baseline, 500.0)
+        self.assertEqual(anchors[0].rounding, "down")
+        for sample, origin in expected.items():
+            self.assertAlmostEqual(origins[sample][0], origin[0])
+            self.assertAlmostEqual(origins[sample][1], origin[1])
+
+    def test_a_shifted_row_is_pulled_back_to_the_others(self):
+        # Two rows agree on the anchor; the third's fitted origin is a
+        # native pixel off and gets the anchor's prediction instead.
+        scale = 1.5
+        placements = [
+            self.placement(
+                f"c_slot{slot}",
+                "c",
+                slot,
+                scale,
+                (0, 0),
+                (0, -9, 30),
+                (10.0, 5.0 + scale * 21 * (slot - 1)),
+            )
+            for slot in (1, 2)
+        ]
+        placements.append(
+            self.placement(
+                "c_slot3",
+                "c",
+                3,
+                scale,
+                (0, 0),
+                (0, -9, 30),
+                (10.0 + scale, 5.0 + scale * 42),
+            )
+        )
+        origins, anchors = predict_origins(placements)
+        self.assertEqual(anchors[0].rounding, "up")
+        self.assertAlmostEqual(origins["c_slot3"][0], 10.0)
+        self.assertAlmostEqual(origins["c_slot3"][1], 5.0 + scale * 42)
+
+    def test_without_even_rows_the_half_rounds_up(self):
+        placements = [
+            self.placement(
+                "c_slot1", "c", 1, 1.5, (0, 0), (0, -9, 47), (10.0, 5.0)
+            )
+        ]
+        origins, anchors = predict_origins(placements)
+        self.assertEqual(anchors[0].rounding, "up")
+        self.assertAlmostEqual(origins["c_slot1"][0], 10.0)
+
+
+class MeasuredKernelContractTests(MeasuredKernelCase):
+    def layout_crops(self, glyphs, taps, scale, rows):
+        # Rows of one capture laid out as the raid window would: the
+        # cell's left edge at capture x 840 and row 1's baseline at
+        # y 500, crops 38 px apart like 21 native rows at s=1.8.
+        _, top, width = text_box(glyphs)
+        references = {}
+        infos = []
+        for sample_id, slot, color in rows:
+            crop = (900, 470 + round(scale * 21 * (slot - 1)))
+            ink_left = 840.0 + scale * cell_offset(width, "up")
+            baseline = 500.0 + scale * 21 * (slot - 1)
+            origin = (
+                ink_left - 2 * scale - crop[0],
+                baseline - scale * (2 - top) - crop[1],
+            )
+            references[sample_id] = (
+                Reference.from_rgba(
+                    kernel_crop(glyphs, scale, origin, taps, (34, 48)),
+                    scale,
+                    "raid",
+                ),
+                color,
+            )
+            infos.append(
+                self.sample_info(sample_id, scale, "c1", slot=slot, crop=crop)
+            )
+
+        return infos, references
+
+    def test_predicted_origins_score_the_rows_at_the_layout_positions(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        infos, references = self.layout_crops(
+            glyphs,
+            trapezoid_taps(),
+            1.8,
+            [
+                ("r1", 1, PLAIN_FILL),
+                ("r2", 2, PLAIN_FILL),
+                ("r3", 3, GLOW_FILL),
+            ],
+        )
+        loose = self.sample_info("x1", 1.8, "c2")
+        references["x1"] = references["r1"]
+        payload, report, _, skipped = self.run_measured(
+            [*infos, loose],
+            references,
+            measured_settings(origins=["fitted", "predicted"]),
+        )
+        self.assertEqual(skipped, [])
+        (measured,) = payload["candidates"]
+        self.assertEqual(
+            list(measured["evaluations"]),
+            ["in_sample", "in_sample_predicted"],
+        )
+        fitted = measured["evaluations"]["in_sample"]
+        predicted = measured["evaluations"]["in_sample_predicted"]
+        self.assertEqual(predicted["unevaluated"], ["x1"])
+        self.assertEqual(predicted["kernels"], {})
+        self.assertEqual(
+            [anchor["case_id"] for anchor in predicted["anchors"]], ["c1"]
+        )
+        self.assertAlmostEqual(
+            predicted["anchors"][0]["cell_left"], 840.0, delta=0.1
+        )
+        self.assertAlmostEqual(
+            predicted["anchors"][0]["first_baseline"], 500.0, delta=0.1
+        )
+        by_sample = {fit["sample"]: fit for fit in fitted["fits"]}
+        for fit in predicted["fits"]:
+            self.assertEqual(fit["mismatch"], 0)
+            for axis in (0, 1):
+                self.assertAlmostEqual(
+                    fit["origin"][axis],
+                    by_sample[fit["sample"]]["origin"][axis],
+                    delta=0.1,
+                )
+        self.assertIn("## measured-bucket in_sample_predicted: 샘플별", report)
+
+    def test_loaded_kernels_score_without_fitting(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        references = self.references(
+            glyphs,
+            trapezoid_taps(),
+            {
+                "b1": (1.8, (3.3, 2.1), PLAIN_FILL),
+                "b2": (1.8, (7.0, 4.6), PLAIN_FILL),
+            },
+        )
+        infos = [
+            self.sample_info("b1", 1.8, "c1"),
+            self.sample_info("b2", 1.8, "c2"),
+        ]
+        settings = measured_settings(
+            candidates=["measured-bucket", "nearest"], residuals=[]
+        )
+        skipped = []
+        with tempfile.TemporaryDirectory() as directory:
+            run_measured_kernel(
+                Path(directory) / "fit",
+                infos,
+                skipped,
+                lambda sample: (glyphs, *references[sample.id]),
+                settings,
+            )
+            kernels = load_kernels(Path(directory) / "fit" / "kernels.json")
+            self.assertEqual(sorted(kernels), ["measured-bucket", "nearest"])
+            self.assertEqual(list(kernels["measured-bucket"]), ["1.8"])
+            fitted = json.loads(
+                (Path(directory) / "fit" / "measured-kernel.json").read_text(
+                    "utf-8"
+                )
+            )
+            run_measured_kernel(
+                Path(directory) / "score",
+                infos,
+                skipped,
+                lambda sample: (glyphs, *references[sample.id]),
+                {**settings, "kernels": "fit/kernels.json"},
+                kernels={"measured-bucket": kernels["measured-bucket"]},
+            )
+            scored = json.loads(
+                (Path(directory) / "score" / "measured-kernel.json").read_text(
+                    "utf-8"
+                )
+            )
+            self.assertFalse(
+                (Path(directory) / "score" / "kernels.json").exists()
+            )
+        self.assertEqual(skipped, [])
+        measured, nearest = scored["candidates"]
+        self.assertEqual(list(measured["evaluations"]), ["holdout_set"])
+        self.assertEqual(
+            measured["evaluations"]["holdout_set"]["kernels"]["1.8"]["taps_x"],
+            fitted["candidates"][0]["evaluations"]["in_sample"]["kernels"][
+                "1.8"
+            ]["taps_x"],
+        )
+        self.assertEqual(
+            [
+                (fit["sample"], fit["mismatch"], fit["fold"])
+                for fit in measured["evaluations"]["holdout_set"]["fits"]
+            ],
+            [("b1", 0, "1.8"), ("b2", 0, "1.8")],
+        )
+        # The fixed shape needs no stored kernel.
+        self.assertEqual(
+            nearest["evaluations"]["holdout_set"]["kernels"]["1.8"]["shape"],
+            "nearest",
+        )
+        with self.assertRaises(ValueError):
+            run_measured_kernel(
+                Path("unused"),
+                infos,
+                skipped,
+                lambda sample: (glyphs, *references[sample.id]),
+                settings,
+                infos,
+                kernels,
+            )
+
+    def test_sharp_captures_only_skips_the_blurred_capture(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        references = self.references(
+            glyphs,
+            trapezoid_taps(),
+            {
+                "b1": (1.8, (3.3, 2.1), PLAIN_FILL),
+                "b2": (1.8, (7.0, 4.6), PLAIN_FILL),
+            },
+        )
+        # Lifting every channel to at least 1 leaves no exact black.
+        reference, color = references["b2"]
+        blurred = reference.rgba.copy()
+        blurred[..., :3] = np.maximum(blurred[..., :3], 1)
+        references["b2"] = (Reference.from_rgba(blurred, 1.8, "raid"), color)
+        infos = [
+            self.sample_info("b1", 1.8, "c1"),
+            self.sample_info("b2", 1.8, "c2"),
+        ]
+        payload, report, _, skipped = self.run_measured(
+            infos, references, measured_settings(captures="sharp")
+        )
+        self.assertEqual(
+            [(entry.sample, entry.reason[:5]) for entry in skipped],
+            [("b2", "흐린 캡처")],
+        )
+        self.assertEqual(
+            [
+                (entry["case_id"], entry["sharp"])
+                for entry in payload["captures"]
+            ],
+            [("c1", True), ("c2", False)],
+        )
+        self.assertEqual(payload["captures"][1]["ratio"], 0.0)
+        (measured,) = payload["candidates"]
+        self.assertEqual(
+            [
+                fit["sample"]
+                for fit in measured["evaluations"]["in_sample"]["fits"]
+            ],
+            ["b1"],
+        )
+        self.assertIn("| c2 | 0.0000 | 흐림 |", report)
+        with self.assertRaises(ValueError):
+            self.run_measured(
+                infos, references, measured_settings(captures="crisp")
+            )
