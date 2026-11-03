@@ -7,34 +7,44 @@ import numpy as np
 from .metrics import Comparison, Reference, bt601_gray, compare
 
 SEARCH_RADIUS = 2
-# Fill colors measured on s=1 raid name cells: plain rows and rows of
-# the viewer's own party. Pixels brighter than the outline and the
-# dark cell background in every channel count as fill.
+# Fill colors measured on s=1 raid name cells: plain rows and glow
+# rows (the viewer's own party), whose name is drawn translucently over
+# a golden glow.
 RAID_FILL_COLORS = {"beige": (214, 197, 146), "yellow": (255, 255, 147)}
-FILL_MIN_CHANNEL = 100
+PLAIN_FILL = RAID_FILL_COLORS["beige"]
+GLOW_FILL = RAID_FILL_COLORS["yellow"]
+# The glow tints the dark background: over the 648 round-1 crops the
+# dark pixels' mean red minus blue was at most 2.4 on plain rows and
+# at least 27.7 on glow rows, while the blended fill of scaled glow
+# rows gets close enough to beige to fool a fill-color distance.
+BACKGROUND_MAX_CHANNEL = 80
+GLOW_MIN_RED_MINUS_BLUE = 15.0
 
 
-def nearest_fill_color(
-    rgba: np.ndarray,
-    palette: dict[str, tuple[int, int, int]] = RAID_FILL_COLORS,
-) -> tuple[int, int, int]:
-    """Pick the palette color closest to a crop's bright pixels.
+def is_glow_row(rgba: np.ndarray) -> bool:
+    """Tell a glow row from a plain row by its background tint.
 
-    The mean of pixels whose channels all reach ``FILL_MIN_CHANNEL``
-    is compared with each palette entry by squared RGB distance, so
-    the choice survives the blended fill of scaled crops. A crop
-    without bright pixels raises ValueError.
+    Pixels whose brightest channel stays below
+    ``BACKGROUND_MAX_CHANNEL`` are background; a crop without any
+    raises ValueError.
     """
     pixels = np.asarray(rgba, dtype=np.uint8).reshape(-1, 4)[:, :3]
-    bright = pixels[pixels.min(axis=1) >= FILL_MIN_CHANNEL]
-    if bright.size == 0:
-        raise ValueError("The crop has no fill-colored pixels.")
-    mean = bright.astype(np.float64).mean(axis=0)
-
-    return min(
-        palette.values(),
-        key=lambda color: float(((mean - np.array(color)) ** 2).sum()),
+    dark = pixels[pixels.max(axis=1) < BACKGROUND_MAX_CHANNEL].astype(
+        np.float64
     )
+    if dark.size == 0:
+        raise ValueError("The crop has no background pixels.")
+    red, _, blue = dark.mean(axis=0)
+
+    return red - blue >= GLOW_MIN_RED_MINUS_BLUE
+
+
+def raid_fill_color(rgba: np.ndarray) -> tuple[int, int, int]:
+    """Return the fill color of a raid name crop from its row kind."""
+    if is_glow_row(rgba):
+        return GLOW_FILL
+
+    return PLAIN_FILL
 
 
 def fill_map(synthetic: np.ndarray, color: tuple[int, int, int]) -> np.ndarray:

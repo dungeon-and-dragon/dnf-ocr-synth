@@ -452,6 +452,24 @@ def line_width(values: list[float]) -> float:
     return up + down
 
 
+def line_center(values: list[float]) -> float:
+    """Locate the darkest dip's center, in rows from the first value.
+
+    The center is the midpoint between the two half-depth crossings
+    ``line_width`` measures, so it carries the line's sub-pixel phase.
+    """
+    center = min(range(len(values)), key=values.__getitem__)
+    low = values[center]
+    above = values[: center + 1][::-1]
+    below = values[center:]
+    if len(above) < 2 or len(below) < 2:
+        return math.nan
+    up = _crossing(above, (low + max(above)) / 2)
+    down = _crossing(below, (low + max(below)) / 2)
+
+    return center + (down - up) / 2
+
+
 def line_profile(
     image: np.ndarray,
     x: int,

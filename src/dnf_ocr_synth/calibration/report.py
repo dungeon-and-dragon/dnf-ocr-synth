@@ -31,6 +31,8 @@ class SampleInfo:
     text: str
     ui_percent: int | None
     capture: str
+    raid: str = ""
+    theory: float | None = None
 
     @property
     def bucket(self) -> str:

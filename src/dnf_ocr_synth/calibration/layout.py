@@ -1,50 +1,95 @@
-"""Re-space a glyph layout the way the raid window draws Hangul.
+"""Lay out a nickname the way the raid window's name cell draws it.
 
-The renderer places Dotum Hangul with the font's 11px advance. In the
-raid window's name cells every Hangul glyph instead starts at the
-cursor and advances its ink width plus one pixel, the spacing the
-renderer already uses for Dotumche ASCII. This module applies that
-spacing for the calibration fit without changing the renderer's
-default output.
+The renderer places Dotum Hangul with the font's 11px advance and
+draws ASCII symbols with the Dotum face. In the raid window's name
+cells every Hangul glyph instead starts at the cursor and advances its
+ink width plus one pixel, the spacing the renderer already uses for
+Dotumche ASCII, and ASCII symbols such as ``!``, ``-``, ``[`` and
+``]`` are the Dotumche glyphs placed the same way. Both rules were
+read off s=1 crops: ``!`` has Dotumche's two-row dot and ``-`` sits on
+Dotumche's row, one lower than Dotum's. This module applies them for
+the calibration fit without changing the renderer's default output.
 """
 
-from ..render import GlyphLayout
+from collections.abc import Callable
 
-INK_ADVANCE_FACES = frozenset({"dotum"})
+from PIL import Image
+
+from ..render import GlyphLayout, Renderer, _raster
+
 ADVANCE_MODES = ("ink", "font")
+HANGUL_FACE = "dotum"
+SYMBOL_FACE = "dotumche"
+
+SymbolRaster = Callable[[str], tuple[Image.Image, tuple[int, int]]]
 
 
-def ink_advance_layout(glyphs: GlyphLayout) -> GlyphLayout:
-    """Return a layout whose ``dotum`` glyphs advance by ink width + 1.
+def is_hangul(character: str) -> bool:
+    """Tell whether ``character`` is a precomposed Hangul syllable."""
+    return "가" <= character <= "힣"
 
-    Other glyphs keep their bearing and advance relative to the
-    cursor, and every vertical position is kept.
+
+def is_ascii_symbol(character: str) -> bool:
+    """Tell whether ``character`` is printable ASCII but not alnum."""
+    return (
+        character.isascii()
+        and character.isprintable()
+        and not character.isalnum()
+        and not character.isspace()
+    )
+
+
+def ink_advance_layout(
+    text: str, glyphs: GlyphLayout, symbol_raster: SymbolRaster
+) -> GlyphLayout:
+    """Return the layout with raid-window Hangul and symbol spacing.
+
+    Hangul glyphs of the Dotum face start at the cursor and advance by
+    ink width + 1. ASCII symbols take ``symbol_raster(character)``, the
+    Dotumche mask with its baseline offset, placed the same way. Other
+    glyphs keep their bearing and advance relative to the cursor, and
+    every vertical position is kept.
     """
     cursor = 0
     original_cursor = 0
+    names = []
+    masks = []
     positions = []
     advances = []
-    for name, mask, (x, y), advance in zip(
-        glyphs.names, glyphs.masks, glyphs.positions, glyphs.advances
+    for character, name, mask, (x, y), advance in zip(
+        text, glyphs.names, glyphs.masks, glyphs.positions, glyphs.advances
     ):
-        if name in INK_ADVANCE_FACES:
+        if name == HANGUL_FACE and is_ascii_symbol(character):
+            name = SYMBOL_FACE
+            mask, (_, y) = symbol_raster(character)
+            positions.append((cursor, y))
+            advances.append(mask.width + 1)
+        elif name == HANGUL_FACE and is_hangul(character):
             positions.append((cursor, y))
             advances.append(mask.width + 1)
         else:
             positions.append((cursor + x - original_cursor, y))
             advances.append(advance)
+        names.append(name)
+        masks.append(mask)
         cursor += advances[-1]
         original_cursor += advance
 
-    return GlyphLayout(glyphs.names, glyphs.masks, positions, advances)
+    return GlyphLayout(names, masks, positions, advances)
 
 
-def layout_with_advance(glyphs: GlyphLayout, mode: str) -> GlyphLayout:
-    """Apply ``mode`` (``ink`` or ``font``) to a renderer layout."""
+def raid_layout(
+    renderer: Renderer, text: str, profile: str, mode: str
+) -> GlyphLayout:
+    """Lay ``text`` out with ``mode`` (``ink`` or ``font``) spacing."""
     if mode not in ADVANCE_MODES:
         raise ValueError(f"advance mode must be one of {ADVANCE_MODES}.")
 
-    if mode == "ink":
-        return ink_advance_layout(glyphs)
+    glyphs = renderer.layout(text, profile=profile)
+    if mode == "font":
+        return glyphs
 
-    return glyphs
+    def symbol_raster(character: str) -> tuple[Image.Image, tuple[int, int]]:
+        return _raster(character, renderer._load(SYMBOL_FACE))
+
+    return ink_advance_layout(text, glyphs, symbol_raster)

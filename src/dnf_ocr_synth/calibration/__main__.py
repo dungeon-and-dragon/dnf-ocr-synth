@@ -6,6 +6,8 @@
         --x 76 --width 178 --y 49
     python -m dnf_ocr_synth.calibration raid-lines --crops index.json
         --originals originals/
+    python -m dnf_ocr_synth.calibration phase --lines raid-lines.jsonl
+        --measured result/measured-kernel.json
 
 ``index.json`` and ``manifest.json`` follow dfragon's
 ``nickname-evaluation`` script, which writes crops as
@@ -16,8 +18,10 @@ nicknames in the manifest. Both name the ``screen`` (``party`` or
 
 import argparse
 import json
+import math
 import sys
 import time
+from collections import defaultdict
 from dataclasses import asdict
 from pathlib import Path
 
@@ -30,17 +34,23 @@ from .align import (
     SEARCH_RADIUS,
     best_candidate,
     estimate_text_origin,
-    nearest_fill_color,
+    raid_fill_color,
     search_alignment,
 )
-from .layout import ADVANCE_MODES, layout_with_advance
-from .measured import run_measured_kernel
+from .layout import ADVANCE_MODES, raid_layout
+from .measured import (
+    CANDIDATES,
+    DEFAULT_RESIDUALS,
+    HOLDOUTS,
+    SCALE_SOURCES,
+    run_measured_kernel,
+)
 from .metrics import (
     SCREENS,
     Reference,
     edge_profile,
+    line_center,
     line_profile,
-    line_width,
 )
 from .pipelines import (
     DEFAULT_PIPELINE,
@@ -86,12 +96,14 @@ def load_samples(
     """
     index = json.loads(crops_index.read_text(encoding="utf-8"))
     labels = {}
+    raids = {}
     cases = _require(
         json.loads(manifest.read_text(encoding="utf-8")), "cases", "manifest"
     )
     for case in cases:
         case_id = _require(case, "id", "manifest case")
         screen = _require_screen(case, "manifest case")
+        raids[case_id] = str(case.get("raid", ""))
         for slot in _require(case, "slots", "manifest case"):
             labels[(case_id, _require(slot, "slot", "manifest slot"))] = (
                 screen,
@@ -126,15 +138,33 @@ def load_samples(
                 case_id,
                 screen,
                 slot,
-                _require(entry, "file", where),
+                str(crops_index.parent / _require(entry, "file", where)),
                 float(_require(entry, "scale", where)),
                 text,
                 entry.get("uiPercent"),
                 str(entry.get("capture", "")),
+                raids[case_id],
+                _theory_scale(entry),
             )
         )
 
     return samples, skipped
+
+
+def _theory_scale(entry: dict) -> float | None:
+    """Return the scale the UI setting predicts, if the entry says.
+
+    This is dfragon's 600px model behind ``estimate_ui_scale``, applied
+    here without its client-height limits because captures of a
+    window taller than 1080 rows are still calibrated.
+    """
+    client = entry.get("client")
+    ui_percent = entry.get("uiPercent")
+    if client is None or ui_percent is None:
+        return None
+    height = int(client["height"])
+
+    return height / (height - (height - 600) * ui_percent / 100)
 
 
 def _add_sample_arguments(parser: argparse.ArgumentParser) -> None:
@@ -154,8 +184,8 @@ def _add_sample_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="R G B | auto",
         default=[str(value) for value in COLOR],
         help=(
-            "Fill color, or 'auto' to pick the raid fill color nearest "
-            "to each crop's bright pixels"
+            "Fill color, or 'auto' to pick the raid fill color by each "
+            "crop's row kind (plain or glow background)"
         ),
     )
     parser.add_argument(
@@ -163,8 +193,9 @@ def _add_sample_arguments(parser: argparse.ArgumentParser) -> None:
         choices=ADVANCE_MODES,
         default="ink",
         help=(
-            "Hangul spacing: ink width + 1 as the raid window draws it "
-            "(default) or the renderer's font advance"
+            "Spacing: Hangul at ink width + 1 and ASCII symbols as "
+            "Dotumche glyphs, as the raid window draws them (default), "
+            "or the renderer's font layout"
         ),
     )
     parser.add_argument("--include-uncertain", action="store_true")
@@ -207,19 +238,87 @@ def _parse_measured(argv: list[str]) -> argparse.Namespace:
     )
     _add_sample_arguments(parser)
     parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument(
+        "--candidates",
+        nargs="+",
+        choices=tuple(CANDIDATES),
+        default=list(CANDIDATES),
+        metavar="NAME",
+        help=f"Kernels to compare, from {', '.join(CANDIDATES)}",
+    )
+    parser.add_argument(
+        "--holdouts",
+        nargs="*",
+        choices=HOLDOUTS,
+        default=list(HOLDOUTS),
+        help="Hold-out schemes for the fitted candidates (default: both)",
+    )
+    parser.add_argument(
+        "--residuals",
+        nargs="*",
+        choices=tuple(CANDIDATES),
+        default=list(DEFAULT_RESIDUALS),
+        metavar="NAME",
+        help="Candidates whose per-sample tables and sheets are written",
+    )
+    parser.add_argument(
+        "--scale-source",
+        choices=SCALE_SOURCES,
+        default="detected",
+        help=(
+            "Resample with the crop's detected scale (default) or the "
+            "scale the client height and UI setting predict"
+        ),
+    )
+    parser.add_argument(
+        "--fit-crops",
+        type=Path,
+        help=(
+            "Estimate parameters from this crop index instead and score "
+            "every --crops crop as hold-out"
+        ),
+    )
+    parser.add_argument(
+        "--fit-manifest", type=Path, help="Manifest of --fit-crops"
+    )
+    parser.add_argument(
+        "--workers", type=int, default=1, help="Alignment processes"
+    )
     args = parser.parse_args(argv)
     args.color = _parse_color(parser, args.color)
+    if (args.fit_crops is None) != (args.fit_manifest is None):
+        parser.error("--fit-crops and --fit-manifest go together")
+    for name in args.residuals:
+        if name not in args.candidates:
+            parser.error(f"--residuals {name} is not among --candidates")
+    for position, name in enumerate(args.candidates):
+        base = CANDIDATES[name].base
+        if base is not None and base not in args.candidates[:position]:
+            parser.error(f"--candidates {name} needs {base} before it")
 
     return args
 
 
 def run_measured(args: argparse.Namespace) -> None:
-    """Fit the measured kernel per bucket and write its report."""
+    """Compare the candidate kernels and write the report."""
     samples, skipped = load_samples(
         args.crops, args.manifest, args.include_uncertain
     )
     if args.limit is not None:
         samples = samples[: args.limit]
+    fit_samples = None
+    if args.fit_crops is not None:
+        fit_samples, fit_skipped = load_samples(
+            args.fit_crops, args.fit_manifest, args.include_uncertain
+        )
+        skipped.extend(fit_skipped)
+
+    if args.scale_source == "theory" and any(
+        sample.theory is None for sample in [*samples, *(fit_samples or [])]
+    ):
+        raise ValueError(
+            "--scale-source theory needs client and uiPercent in every crop."
+        )
     renderer = Renderer(
         FontPaths(
             gulim=args.gulim,
@@ -229,20 +328,26 @@ def run_measured(args: argparse.Namespace) -> None:
         )
     )
     settings = {
+        "candidates": args.candidates,
+        "holdouts": args.holdouts,
+        "residuals": args.residuals,
         "iterations": args.iterations,
+        "scale_source": args.scale_source,
+        "workers": args.workers,
         "profile": args.profile,
         "color": "auto" if args.color is None else list(args.color),
         "advance": args.advance,
         "crops": str(args.crops),
         "manifest": str(args.manifest),
+        "fit_crops": None if args.fit_crops is None else str(args.fit_crops),
     }
     run_measured_kernel(
         args.out,
         samples,
         skipped,
         lambda sample: _prepare_sample(args, renderer, sample),
-        args.iterations,
         settings,
+        fit_samples,
     )
     print(args.out / "measured-kernel.md")
 
@@ -267,7 +372,7 @@ def _sample_color(
     color: tuple[int, int, int] | None, crop: np.ndarray
 ) -> tuple[int, int, int]:
     if color is None:
-        return nearest_fill_color(crop)
+        return raid_fill_color(crop)
 
     return color
 
@@ -368,10 +473,8 @@ def run_fit(args: argparse.Namespace) -> None:
 def _prepare_sample(
     args: argparse.Namespace, renderer: Renderer, sample: SampleInfo
 ) -> tuple[GlyphLayout, Reference, tuple[int, int, int]]:
-    glyphs = layout_with_advance(
-        renderer.layout(sample.text, profile=args.profile), args.advance
-    )
-    crop = _load_crop(args.crops.parent / sample.file)
+    glyphs = raid_layout(renderer, sample.text, args.profile, args.advance)
+    crop = _load_crop(Path(sample.file))
     reference = Reference.from_rgba(crop, sample.scale, sample.screen)
 
     return glyphs, reference, _sample_color(args.color, crop)
@@ -452,6 +555,7 @@ RAID_NAME_LEFT = 182
 RAID_NAME_TOP = RAID_HEADING_HEIGHT + 3
 RAID_NAME_WIDTH = 86
 RAID_SEPARATOR_LINES = range(1, 12)
+LINE_SEARCH_ROWS = 2
 
 
 def _parse_raid_lines(argv: list[str]) -> argparse.Namespace:
@@ -479,11 +583,13 @@ def _parse_raid_lines(argv: list[str]) -> argparse.Namespace:
 def raid_separator_profiles(
     index: dict, originals: Path, window: int
 ) -> list[dict]:
-    """Measure the separator lines under the name column per case.
+    """Measure each separator line under the name column per case.
 
-    The heading anchor is recovered from each case's row 1 crop, and
-    the darkest-channel profile is averaged over the lines between
-    rows 1 to 12 so a single name's ink does not dominate.
+    The heading anchor is recovered from each case's row 1 crop. Every
+    line between rows 1 to 12 is measured on its own darkest-channel
+    profile, so lines at different sub-pixel phases are not averaged
+    into one; the case keeps the median width and the per-line
+    widths and centers (rows from the top of the capture).
     """
     results = []
     for entry in _require(index, "crops", "crop index"):
@@ -503,40 +609,196 @@ def raid_separator_profiles(
             darkest = np.asarray(image.convert("RGB")).min(axis=2)[..., None]
         x = round(anchor_x + (RAID_NAME_LEFT + 1) * scale)
         width = round((RAID_NAME_WIDTH - 2) * scale)
-        values = np.mean(
-            [
-                line_profile(
-                    darkest,
-                    x,
-                    width,
-                    round(
-                        anchor_y
-                        + (RAID_HEADING_HEIGHT + RAID_ROW_SPACING * line)
-                        * scale
-                    ),
-                    window,
-                ).values
-                for line in RAID_SEPARATOR_LINES
-            ],
-            axis=0,
-        ).tolist()
+        lines = []
+        for line in RAID_SEPARATOR_LINES:
+            expected = round(
+                anchor_y
+                + (RAID_HEADING_HEIGHT + RAID_ROW_SPACING * line) * scale
+            )
+            # The expected row drifts a row or two from the line on
+            # some captures, so center the window on the darkest row
+            # nearby before measuring.
+            wide = line_profile(
+                darkest, x, width, expected, window + LINE_SEARCH_ROWS
+            )
+            darkest_row = wide.rows[
+                min(range(len(wide.values)), key=wide.values.__getitem__)
+            ]
+            profile = line_profile(darkest, x, width, darkest_row, window)
+            lines.append(
+                {
+                    "line": line,
+                    "values": [round(value, 2) for value in profile.values],
+                    "width_rows": profile.width_rows,
+                    "center_row": profile.rows[0]
+                    + line_center(profile.values),
+                }
+            )
         results.append(
             {
                 "caseId": case_id,
                 "scale": scale,
-                "values": [round(value, 2) for value in values],
-                "width_rows": line_width(values),
+                "width_rows": float(
+                    np.median([line["width_rows"] for line in lines])
+                ),
+                "lines": lines,
             }
         )
 
     return results
 
 
+def line_width_fit(results: list[dict]) -> dict:
+    """Fit ``width = slope * scale + intercept`` over every scaled line.
+
+    Only lines of cases with scale above 1 enter, since s=1 lines are
+    exactly two rows and would anchor the fit.
+    """
+    points = [
+        (result["scale"], line["width_rows"])
+        for result in results
+        if result["scale"] > 1
+        for line in result["lines"]
+        if not math.isnan(line["width_rows"])
+    ]
+    if len(points) < 2:
+        return {"lines": len(points)}
+    scales, widths = np.array(points).T
+    slope, intercept = np.polyfit(scales, widths, 1)
+
+    return {
+        "lines": len(points),
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "correlation": float(np.corrcoef(scales, widths)[0, 1]),
+    }
+
+
 def run_raid_lines(args: argparse.Namespace) -> None:
-    """Print one JSON object per case with the separator line width."""
+    """Print one JSON object per case, then the width-to-scale fit."""
     index = json.loads(args.crops.read_text(encoding="utf-8"))
-    for result in raid_separator_profiles(index, args.originals, args.window):
+    results = raid_separator_profiles(index, args.originals, args.window)
+    for result in results:
         print(json.dumps(result, ensure_ascii=False))
+    print(json.dumps({"fit": line_width_fit(results)}, ensure_ascii=False))
+
+
+def _parse_phase(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="python -m dnf_ocr_synth.calibration phase",
+        description=(
+            "Compare the sub-pixel phase of the text origins with the "
+            "separator line centers per case, to see whether captures "
+            "at the same scale but another window position move text "
+            "and lines together."
+        ),
+    )
+    parser.add_argument(
+        "--measured",
+        type=Path,
+        required=True,
+        help="measured-kernel.json of the candidate to read origins from",
+    )
+    parser.add_argument(
+        "--candidate", default="measured-bucket", help="Candidate name"
+    )
+    parser.add_argument(
+        "--mode",
+        default="in_sample",
+        help="Evaluation whose origins to read, such as holdout_set",
+    )
+    parser.add_argument(
+        "--lines", type=Path, required=True, help="raid-lines JSONL output"
+    )
+
+    return parser.parse_args(argv)
+
+
+def phase_table(
+    measured: dict, candidate: str, lines: list[dict], mode: str = "in_sample"
+) -> list[dict]:
+    """Join each case's text-origin phases with its line-center phases.
+
+    Per row crop the fractional parts of the fitted origin (x and y)
+    under ``mode`` are listed, per separator line the fractional part
+    of its center. ``row_scale`` and ``line_scale`` divide the span
+    between the first and last origin or center by the native row
+    spacing, an estimate of the scale that does not use the detected
+    one. Two captures of the same scale whose window moved together
+    show the same per-row and per-line phase shift.
+    """
+    entry = next(
+        (item for item in measured["candidates"] if item["name"] == candidate),
+        None,
+    )
+    if entry is None:
+        raise ValueError(f"{candidate!r} is not in the measured report.")
+
+    if mode not in entry["evaluations"]:
+        raise ValueError(f"{candidate!r} has no {mode!r} evaluation.")
+    origins: dict[str, dict[int, tuple[float, float]]] = defaultdict(dict)
+    for fit in entry["evaluations"][mode]["fits"]:
+        case_id, slot = fit["sample"].rsplit("_slot", 1)
+        origins[case_id][int(slot)] = tuple(fit["origin"])
+    rows = []
+    for result in lines:
+        case_id = result["caseId"]
+        if case_id not in origins:
+            continue
+        slots = sorted(origins[case_id])
+        centers = {
+            line["line"]: line["center_row"]
+            for line in result["lines"]
+            if not math.isnan(line["center_row"])
+        }
+        rows.append(
+            {
+                "caseId": case_id,
+                "scale": result["scale"],
+                "rows": {
+                    str(slot): [
+                        round(origins[case_id][slot][0] % 1, 3),
+                        round(origins[case_id][slot][1] % 1, 3),
+                    ]
+                    for slot in slots
+                },
+                "lines": {
+                    str(line): round(center % 1, 3)
+                    for line, center in sorted(centers.items())
+                },
+                "row_scale": _span_scale(
+                    {slot: origins[case_id][slot][1] for slot in slots}
+                ),
+                "line_scale": _span_scale(centers),
+            }
+        )
+
+    return sorted(rows, key=lambda row: (row["scale"], row["caseId"]))
+
+
+def _span_scale(positions: dict[int, float]) -> float:
+    """Divide the first-to-last span by the native rows it covers."""
+    if len(positions) < 2:
+        return math.nan
+    first, last = min(positions), max(positions)
+
+    return round(
+        (positions[last] - positions[first])
+        / (RAID_ROW_SPACING * (last - first)),
+        4,
+    )
+
+
+def run_phase(args: argparse.Namespace) -> None:
+    """Print one JSON object per case with text and line phases."""
+    measured = json.loads(args.measured.read_text(encoding="utf-8"))
+    lines = [
+        json.loads(line)
+        for line in args.lines.read_text(encoding="utf-8").splitlines()
+        if line.strip() and "caseId" in line
+    ]
+    for row in phase_table(measured, args.candidate, lines, args.mode):
+        print(json.dumps(row, ensure_ascii=False))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -547,6 +809,8 @@ def main(argv: list[str] | None = None) -> None:
             run_hp_edge(_parse_hp_edge(arguments[1:]))
         elif arguments[:1] == ["raid-lines"]:
             run_raid_lines(_parse_raid_lines(arguments[1:]))
+        elif arguments[:1] == ["phase"]:
+            run_phase(_parse_phase(arguments[1:]))
         elif arguments[:1] == ["measured-kernel"]:
             run_measured(_parse_measured(arguments[1:]))
         else:
