@@ -1,7 +1,9 @@
 import contextlib
+import dataclasses
 import io
 import json
 import math
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,21 +17,28 @@ except ImportError:  # pragma: no cover - the calib extra is optional
 
 from dnf_ocr_synth.calibration.__main__ import (
     _parse_fit,
+    _parse_measured,
+    line_width_fit,
     load_samples,
     main,
+    phase_table,
     raid_separator_profiles,
 )
 from dnf_ocr_synth.calibration.align import (
-    RAID_FILL_COLORS,
+    GLOW_FILL,
+    PLAIN_FILL,
     best_candidate,
     estimate_text_origin,
-    nearest_fill_color,
+    is_glow_row,
+    raid_fill_color,
     search_alignment,
 )
 from dnf_ocr_synth.calibration.kernel import (
     KernelTaps,
+    StandardKernel,
     align_sample,
     estimate_kernel,
+    fit_gain,
     model_composite,
     native_layers,
     resample,
@@ -39,9 +48,11 @@ from dnf_ocr_synth.calibration.kernel import (
 )
 from dnf_ocr_synth.calibration.layout import (
     ink_advance_layout,
-    layout_with_advance,
+    raid_layout,
 )
-from dnf_ocr_synth.calibration.measured import run_measured_kernel
+from dnf_ocr_synth.calibration.measured import (
+    run_measured_kernel,
+)
 from dnf_ocr_synth.calibration.metrics import (
     Reference,
     binarize_nickname_pixels,
@@ -50,6 +61,7 @@ from dnf_ocr_synth.calibration.metrics import (
     bt601_gray,
     compare,
     edge_profile,
+    line_center,
     line_profile,
     line_width,
     otsu_threshold,
@@ -70,9 +82,11 @@ from dnf_ocr_synth.calibration.report import (
     scale_bucket,
     write_report,
 )
-from dnf_ocr_synth.render import GlyphLayout, _colorize, _compose
+from dnf_ocr_synth.fonts import FontPaths
+from dnf_ocr_synth.render import GlyphLayout, Renderer, _colorize, _compose
 
 FIXTURES = Path(__file__).parent / "fixtures"
+GULIM = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts/gulim.ttc"
 COLOR = (75, 209, 255)
 PORTED_CHAINS = {
     "binarizeNicknamePixels": (binarize_nickname_pixels,),
@@ -559,6 +573,15 @@ class LineProfileTests(unittest.TestCase):
     def test_flat_profile_has_no_width(self):
         self.assertTrue(math.isnan(line_width([5, 5, 5])))
 
+    def test_line_center_carries_the_sub_pixel_phase(self):
+        # A symmetric two-row line centers between its rows; a line
+        # leaking a third of its depth into the row below sits lower.
+        self.assertAlmostEqual(
+            line_center([20, 20, 0, 0, 20, 20, 20]), 2.5, places=6
+        )
+        self.assertGreater(line_center([20, 20, 0, 0, 10, 20, 20]), 2.5)
+        self.assertTrue(math.isnan(line_center([5, 5, 5])))
+
     def test_line_profile_averages_the_columns_of_the_band(self):
         image = np.full((12, 20, 1), 40, dtype=np.uint8)
         image[5:7, :, 0] = 0
@@ -593,8 +616,36 @@ class RaidSeparatorTests(unittest.TestCase):
             results = raid_separator_profiles(index, Path(directory), 3)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["caseId"], "case")
-        self.assertEqual(results[0]["values"][3:5], [0.0, 0.0])
+        self.assertEqual(len(results[0]["lines"]), 11)
+        self.assertEqual(results[0]["lines"][0]["values"][3:5], [0.0, 0.0])
         self.assertAlmostEqual(results[0]["width_rows"], 2.0, places=6)
+        # Line 5 covers rows anchor + 18 + 105 and the next one.
+        self.assertAlmostEqual(
+            results[0]["lines"][4]["center_row"], 50 + 123 + 0.5, places=6
+        )
+        self.assertEqual(line_width_fit(results), {"lines": 0})
+
+    def test_width_fit_reports_the_observed_line_through_scaled_lines(self):
+        results = [
+            {"scale": 1.0, "lines": [{"width_rows": 2.0}]},
+            {
+                "scale": 1.5,
+                "lines": [{"width_rows": 2.8}, {"width_rows": 2.8}],
+            },
+            {
+                "scale": 1.8,
+                "lines": [{"width_rows": 3.4}, {"width_rows": math.nan}],
+            },
+        ]
+        fit = line_width_fit(results)
+        self.assertEqual(fit["lines"], 3)
+        self.assertAlmostEqual(fit["slope"], 2.0, places=6)
+        self.assertAlmostEqual(fit["intercept"], -0.2, places=6)
+        self.assertAlmostEqual(fit["correlation"], 1.0, places=6)
+
+
+def no_symbols(character):
+    raise AssertionError(f"unexpected symbol raster for {character!r}")
 
 
 class LayoutTests(unittest.TestCase):
@@ -603,7 +654,7 @@ class LayoutTests(unittest.TestCase):
 
         return GlyphLayout(names, masks, positions, advances)
 
-    def test_dotum_glyphs_start_at_the_cursor_and_advance_by_ink(self):
+    def test_hangul_glyphs_start_at_the_cursor_and_advance_by_ink(self):
         # Font advance 11 with bearings 1, 0, 1; the raid window packs
         # each glyph at ink width + 1 instead.
         glyphs = self.glyphs(
@@ -612,37 +663,85 @@ class LayoutTests(unittest.TestCase):
             [(1, -9), (11, -9), (23, -9)],
             [11, 11, 11],
         )
-        spaced = ink_advance_layout(glyphs)
+        spaced = ink_advance_layout("가나다", glyphs, no_symbols)
         self.assertEqual(spaced.positions, [(0, -9), (9, -9), (19, -9)])
         self.assertEqual(spaced.advances, [9, 10, 11])
-        self.assertIs(spaced.masks, glyphs.masks)
+        self.assertEqual(spaced.masks, glyphs.masks)
+        self.assertEqual(spaced.names, glyphs.names)
 
-    def test_other_faces_keep_their_bearing_and_advance(self):
+    def test_other_faces_and_non_hangul_dotum_keep_their_bearing(self):
+        # Dotumche "D" and a Dotum kana keep the renderer's placement
+        # relative to the cursor; only the Hangul glyphs re-pack.
         glyphs = self.glyphs(
-            ["dotum", "dotumche", "dotum"],
-            [8, 5, 9],
-            [(1, -9), (11, -7), (18, -9)],
-            [11, 6, 11],
+            ["dotum", "dotumche", "dotum", "dotum"],
+            [8, 5, 9, 9],
+            [(1, -9), (11, -7), (18, -9), (30, -9)],
+            [11, 6, 11, 11],
         )
-        spaced = ink_advance_layout(glyphs)
-        self.assertEqual(spaced.positions, [(0, -9), (9, -7), (15, -9)])
-        self.assertEqual(spaced.advances, [9, 6, 10])
-
-    def test_font_mode_keeps_the_renderer_layout(self):
-        glyphs = self.glyphs(["dotum"], [8], [(1, -9)], [11])
-        self.assertIs(layout_with_advance(glyphs, "font"), glyphs)
+        spaced = ink_advance_layout("가Dぎ나", glyphs, no_symbols)
         self.assertEqual(
-            layout_with_advance(glyphs, "ink").positions, [(0, -9)]
+            spaced.positions, [(0, -9), (9, -7), (16, -9), (26, -9)]
         )
+        self.assertEqual(spaced.advances, [9, 6, 11, 10])
+
+    def test_ascii_symbols_take_the_dotumche_glyph_at_the_cursor(self):
+        # The renderer gives "!" the 1x8 Dotum glyph one px right of
+        # the cursor and advance 3; the raid window draws Dotumche's
+        # "!" at the cursor and advances its ink width + 1.
+        glyphs = self.glyphs(
+            ["dotum", "dotum"], [8, 1], [(1, -9), (10, -8)], [11, 3]
+        )
+        dotumche = Image.new("L", (2, 8), 255)
+
+        def symbol_raster(character):
+            self.assertEqual(character, "!")
+            return dotumche, (3, -7)
+
+        spaced = ink_advance_layout("가!", glyphs, symbol_raster)
+        self.assertEqual(spaced.names, ["dotum", "dotumche"])
+        self.assertIs(spaced.masks[1], dotumche)
+        self.assertEqual(spaced.positions, [(0, -9), (9, -7)])
+        self.assertEqual(spaced.advances, [9, 3])
+
+    def test_advance_option_accepts_ink_and_font(self):
+        required = ["--crops", "i.json", "--manifest", "m.json", "--out", "o"]
+        self.assertEqual(_parse_measured(required).advance, "ink")
+        self.assertEqual(
+            _parse_measured([*required, "--advance", "font"]).advance, "font"
+        )
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                _parse_measured([*required, "--advance", "metrics"])
+
+
+@unittest.skipUnless(GULIM.is_file(), "Supply the local Windows gulim font")
+class RaidLayoutTests(unittest.TestCase):
+    def test_ink_mode_draws_symbols_with_dotumche_and_font_mode_does_not(self):
+        renderer = Renderer(FontPaths(gulim=GULIM))
+        # Read off s=1 crops: the game's "!" has a two-row dot and the
+        # "-" sits one row lower than Dotum's, both as Dotumche draws
+        # them, and each starts at the cursor with ink width + 1.
+        ink = raid_layout(renderer, "앞!-", "dotum", "ink")
+        self.assertEqual(ink.names, ["dotum", "dotumche", "dotumche"])
+        self.assertEqual(ink.positions[1], (ink.advances[0], -8))
+        self.assertEqual(ink.advances[1], 2)
+        self.assertEqual(
+            ink_rows(np.asarray(ink.masks[1])[..., None].repeat(4, 2) ^ 255),
+            ["#", "#", "#", "#", "#", ".", "#", "#"],
+        )
+        self.assertEqual(ink.positions[2], (ink.advances[0] + 2, -4))
+        font = raid_layout(renderer, "앞!-", "dotum", "font")
+        self.assertEqual(font.names, ["dotum", "dotum", "dotum"])
+        self.assertEqual(font.positions, renderer.layout("앞!-").positions)
         with self.assertRaises(ValueError):
-            layout_with_advance(glyphs, "metrics")
+            raid_layout(renderer, "앞", "dotum", "metrics")
 
 
 def trapezoid_taps():
     # Flat to 0.5 crop px, then linear to zero at 1.5 crop px.
     values = tuple(
         max(0.0, min(1.0, (1.5 - distance) / 1.0))
-        for distance in (index * 0.25 for index in range(tap_count()))
+        for distance in (index * 0.25 for index in range(tap_count("crop")))
     )
 
     return KernelTaps(values, values)
@@ -661,7 +760,7 @@ def kernel_crop(glyphs, scale, origin, taps, size, fill_value=146, bg=20):
 
 class KernelTests(unittest.TestCase):
     def test_tap_basis_interpolates_between_neighboring_taps(self):
-        basis = tap_basis(np.array([0.1, -0.1, 0.25, 4.5]))
+        basis = tap_basis(np.array([0.1, -0.1, 0.25, 4.5]), 0.25, 17)
         self.assertAlmostEqual(basis[0, 0], 0.6)
         self.assertAlmostEqual(basis[0, 1], 0.4)
         np.testing.assert_allclose(basis[1], basis[0])
@@ -669,9 +768,65 @@ class KernelTests(unittest.TestCase):
         self.assertEqual(basis[3].sum(), 0.0)
         distances = np.linspace(-3, 3, 25)
         np.testing.assert_allclose(
-            tap_basis(distances) @ np.array(tent_taps(2.0).x),
+            tent_taps(2.0).weights(distances, 2.0, "x"),
             np.maximum(0, 1 - np.abs(distances) / 2.0),
         )
+
+    def test_native_taps_describe_the_kernel_in_source_pixels(self):
+        native = tent_taps(1.5, "native")
+        self.assertEqual(native.unit, "native")
+        self.assertEqual(native.spacing, 0.125)
+        distances = np.linspace(-3, 3, 25)
+        for scale in (1.2, 1.8):
+            with self.subTest(scale=scale):
+                np.testing.assert_allclose(
+                    native.weights(distances, scale, "y"),
+                    np.maximum(0, 1 - np.abs(distances) / scale),
+                )
+                self.assertAlmostEqual(native.integral("x", scale), 1.0)
+        with self.assertRaises(ValueError):
+            KernelTaps((1.0,), (1.0,), "texel")
+
+    def test_integral_counts_the_last_tap_once(self):
+        # Three taps of 1 at 0, 0.25 and 0.5 crop px make a box from
+        # -0.5 to 0.5, so the area is 1 crop px, not 1.25.
+        box = KernelTaps((1.0, 1.0, 1.0), (1.0, 0.0, 0.0))
+        self.assertAlmostEqual(box.integral("x", 1.0), 1.0)
+        self.assertAlmostEqual(box.integral("x", 2.0), 0.5)
+        self.assertAlmostEqual(box.integral("y", 1.0), 0.25)
+        unit = box.unit_gain(1.0)
+        self.assertAlmostEqual(
+            unit.integral("x", 1.0) * unit.integral("y", 1.0), 1.0
+        )
+        self.assertEqual(unit.y, box.y)
+
+    def test_standard_shapes_are_unit_area_and_the_gain_scales_x(self):
+        distances = np.linspace(-4, 4, 81)
+        for shape in ("nearest", "bilinear", "catmull-rom"):
+            with self.subTest(shape=shape):
+                kernel = StandardKernel(shape)
+                self.assertAlmostEqual(kernel.integral("x", 1.5), 1.0, 3)
+                self.assertAlmostEqual(kernel.integral("y", 1.5), 1.0, 3)
+        doubled = StandardKernel("nearest2x-bilinear")
+        np.testing.assert_allclose(
+            doubled.weights(np.array([0.0, 0.45, 0.9, 1.35]), 1.8, "y"),
+            [1.0, 1.0, 0.5, 0.0],
+        )
+        np.testing.assert_allclose(
+            StandardKernel("box-bilinear").weights(
+                np.array([0.0, 1.0, 1.5]), 1.0, "y"
+            ),
+            [0.75, 0.125, 0.0],
+        )
+        gained = StandardKernel("bilinear", 1.1)
+        np.testing.assert_allclose(
+            gained.weights(distances, 1.0, "x"),
+            1.1 * np.maximum(0, 1 - np.abs(distances)),
+        )
+        self.assertAlmostEqual(gained.integral("x", 1.0), 1.1, 3)
+        self.assertAlmostEqual(gained.integral("y", 1.0), 1.0, 3)
+        with self.assertRaises(ValueError):
+            StandardKernel("lanczos")
 
     def test_native_layers_pad_by_two_and_outline_by_one(self):
         mask = Image.new("L", (1, 2), 255)
@@ -689,7 +844,9 @@ class KernelTests(unittest.TestCase):
         )
 
     def test_box_taps_double_a_pixel_at_scale_two(self):
-        box = KernelTaps((1.0, 1.0, 1.0, 1.0) + (0.0,) * (tap_count() - 4), ())
+        box = KernelTaps(
+            (1.0, 1.0, 1.0, 1.0) + (0.0,) * (tap_count("crop") - 4), ()
+        )
         fill = np.ones((1, 1), dtype=bool)
         coverage, filled = resample(
             fill, fill, 2.0, (1.0, 1.0), KernelTaps(box.x, box.x), (4, 4)
@@ -757,6 +914,38 @@ class KernelTests(unittest.TestCase):
             delta=0.05,
         )
 
+    def test_native_estimation_recovers_one_kernel_across_scales(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        # The same source-pixel kernel, a tent to 0.75 px, rendered at
+        # two scales; the native fit must find it from both at once.
+        truth = StandardKernel("nearest2x-bilinear")
+        samples = []
+        for scale, origin in ((1.4, (3.3, 2.1)), (1.8, (5.0, 4.6))):
+            crop = kernel_crop(glyphs, scale, origin, truth, (34, 48))
+            reference = Reference.from_rgba(crop, scale, "raid")
+            samples.append(align_sample(reference, glyphs, 146, scale, truth))
+        estimated = estimate_kernel(samples, 1.6, unit="native")
+        self.assertEqual(estimated.unit, "native")
+        # The axis gains trade off against each other, so compare the
+        # product of the x and y taps out to where the tent ends.
+        product = np.array(estimated.x[:8]) * np.array(estimated.y[:8])
+        expected = np.clip(1.5 - 2 * np.array(estimated.distances[:8]), 0, 1)
+        np.testing.assert_allclose(product, expected**2, atol=0.05)
+
+    def test_gain_fit_recovers_a_brightened_bilinear(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        truth = StandardKernel("bilinear", 1.12)
+        crop = kernel_crop(glyphs, 1.5, (3.0, 2.0), truth, (30, 40))
+        reference = Reference.from_rgba(crop, 1.5, "raid")
+        sample = align_sample(reference, glyphs, 146, 1.5, truth)
+        self.assertAlmostEqual(
+            fit_gain([sample], StandardKernel("bilinear")), 1.12, delta=0.01
+        )
+        with self.assertRaises(ValueError):
+            fit_gain([], StandardKernel("bilinear"))
+
     def test_layers_larger_than_the_crop_are_rejected(self):
         masks, positions = synthetic_layout()
         glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
@@ -767,78 +956,47 @@ class KernelTests(unittest.TestCase):
             align_sample(tiny, glyphs, 146, 1.0)
 
 
+def measured_settings(**overrides):
+    settings = {
+        "candidates": ["measured-bucket"],
+        "holdouts": [],
+        "residuals": ["measured-bucket"],
+        "iterations": 2,
+        "scale_source": "detected",
+        "workers": 1,
+    }
+    settings.update(overrides)
+
+    return settings
+
+
 class MeasuredKernelTests(unittest.TestCase):
-    def sample_info(self, sample_id, scale):
+    def sample_info(self, sample_id, scale, case_id="c", raid="A"):
         return SampleInfo(
-            sample_id, "c", "raid", 1, f"{sample_id}.png", scale, "가", 0, ""
+            sample_id,
+            case_id,
+            "raid",
+            1,
+            f"{sample_id}.png",
+            scale,
+            "가",
+            0,
+            "",
+            raid,
+            scale,
         )
 
-    def test_bucket_without_plain_rows_is_skipped_and_reported(self):
+    def run_measured(self, infos, references, settings):
         masks, positions = synthetic_layout()
         glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
-        crop = kernel_crop(glyphs, 1.5, (3.0, 2.0), trapezoid_taps(), (30, 40))
-        reference = Reference.from_rgba(crop, 1.5, "raid")
-        yellow = RAID_FILL_COLORS["yellow"]
         skipped = []
         with tempfile.TemporaryDirectory() as directory:
             run_measured_kernel(
                 Path(directory),
-                [self.sample_info("y1", 1.5)],
-                skipped,
-                lambda sample: (glyphs, reference, yellow),
-                1,
-                {"iterations": 1},
-            )
-            payload = json.loads(
-                (Path(directory) / "measured-kernel.json").read_text("utf-8")
-            )
-        self.assertEqual(payload["buckets"], [])
-        self.assertEqual([entry.sample for entry in skipped], ["y1"])
-        self.assertIn("1.5", skipped[0].reason)
-
-    def test_plain_rows_fit_the_bucket_and_every_row_is_scored(self):
-        masks, positions = synthetic_layout()
-        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
-        taps = trapezoid_taps()
-        beige = RAID_FILL_COLORS["beige"]
-        yellow = RAID_FILL_COLORS["yellow"]
-        # Two plain rows at different sub-pixel phases pin the kernel
-        # down; the own-party row shares a phase and is only scored.
-        references = {
-            "b1": (
-                Reference.from_rgba(
-                    kernel_crop(glyphs, 1.8, (3.3, 2.1), taps, (34, 48)),
-                    1.8,
-                    "raid",
-                ),
-                beige,
-            ),
-            "b2": (
-                Reference.from_rgba(
-                    kernel_crop(glyphs, 1.8, (7.0, 4.6), taps, (34, 48)),
-                    1.8,
-                    "raid",
-                ),
-                beige,
-            ),
-            "y1": (
-                Reference.from_rgba(
-                    kernel_crop(glyphs, 1.8, (3.3, 2.1), taps, (34, 48)),
-                    1.8,
-                    "raid",
-                ),
-                yellow,
-            ),
-        }
-        skipped = []
-        with tempfile.TemporaryDirectory() as directory:
-            run_measured_kernel(
-                Path(directory),
-                [self.sample_info(name, 1.8) for name in ("b1", "b2", "y1")],
+                infos,
                 skipped,
                 lambda sample: (glyphs, *references[sample.id]),
-                2,
-                {"iterations": 2},
+                settings,
             )
             payload = json.loads(
                 (Path(directory) / "measured-kernel.json").read_text("utf-8")
@@ -849,48 +1007,281 @@ class MeasuredKernelTests(unittest.TestCase):
             residuals = sorted(
                 path.name for path in (Path(directory) / "residual").iterdir()
             )
+
+        return payload, report, residuals, skipped
+
+    def references(self, glyphs, taps, placements):
+        return {
+            name: (
+                Reference.from_rgba(
+                    kernel_crop(glyphs, scale, origin, taps, (34, 48)),
+                    scale,
+                    "raid",
+                ),
+                color,
+            )
+            for name, (scale, origin, color) in placements.items()
+        }
+
+    def test_bucket_without_plain_rows_is_left_unevaluated(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        references = self.references(
+            glyphs,
+            trapezoid_taps(),
+            {
+                "y1": (1.5, (3.0, 2.0), GLOW_FILL),
+                "b1": (1.8, (3.3, 2.1), PLAIN_FILL),
+            },
+        )
+        payload, report, _, skipped = self.run_measured(
+            [self.sample_info("y1", 1.5), self.sample_info("b1", 1.8)],
+            references,
+            measured_settings(),
+        )
         self.assertEqual(skipped, [])
-        (bucket,) = payload["buckets"]
-        self.assertEqual(bucket["bucket"], "1.8")
-        self.assertEqual(bucket["estimation_samples"], 2)
+        (measured,) = payload["candidates"]
+        in_sample = measured["evaluations"]["in_sample"]
+        self.assertEqual(in_sample["unevaluated"], ["y1"])
+        self.assertEqual(list(in_sample["groups"]), ["1.8"])
+        self.assertIn("빠진 crop: y1", report)
+
+    def test_plain_rows_fit_the_bucket_and_every_row_is_scored(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        # Two plain rows at different sub-pixel phases pin the kernel
+        # down; the glow row shares a phase and is only scored, and the
+        # s=1 crop is scored by the fixed shape alone.
+        references = self.references(
+            glyphs,
+            trapezoid_taps(),
+            {
+                "b1": (1.8, (3.3, 2.1), PLAIN_FILL),
+                "b2": (1.8, (7.0, 4.6), PLAIN_FILL),
+                "y1": (1.8, (3.3, 2.1), GLOW_FILL),
+            },
+        )
+        references.update(
+            self.references(
+                glyphs,
+                StandardKernel("nearest"),
+                {"u1": (1.0, (3.0, 2.0), PLAIN_FILL)},
+            )
+        )
+        infos = [
+            self.sample_info("b1", 1.8, "c1"),
+            self.sample_info("b2", 1.8, "c2"),
+            self.sample_info("y1", 1.8, "c1"),
+            self.sample_info("u1", 1.0, "c3"),
+        ]
+        payload, report, residuals, skipped = self.run_measured(
+            infos,
+            references,
+            measured_settings(
+                candidates=["measured-bucket", "nearest"],
+                holdouts=["capture", "raid"],
+            ),
+        )
+        self.assertEqual(skipped, [])
+        measured, nearest = payload["candidates"]
+        self.assertEqual(measured["name"], "measured-bucket")
+        in_sample = measured["evaluations"]["in_sample"]
+        self.assertEqual(list(in_sample["groups"]), ["1.8"])
+        self.assertEqual(in_sample["groups"]["1.8"]["plain_samples"], 2)
+        self.assertEqual(in_sample["groups"]["1.8"]["samples"], 3)
+        self.assertEqual(in_sample["groups"]["1.8"]["mismatch"], 0)
+        self.assertEqual(in_sample["groups"]["1.8"]["passed"], 3)
         self.assertEqual(
-            [(fit["sample"], fit["estimated_from"]) for fit in bucket["fits"]],
+            [(fit["sample"], fit["plain"]) for fit in in_sample["fits"]],
             [("b1", True), ("b2", True), ("y1", False)],
         )
-        self.assertEqual(bucket["mismatch"], 0)
-        self.assertIn("| 1.8 | 3 | 2 |", report)
+        self.assertEqual(in_sample["kernels"]["1.8"]["unit"], "crop")
+        # Leaving capture c1 out leaves b2 alone to fit c1's rows, and
+        # the raid hold-out has no other raid to fit from.
+        capture = measured["evaluations"]["holdout_capture"]
+        self.assertEqual(
+            sorted((fit["sample"], fit["fold"]) for fit in capture["fits"]),
+            [("b1", "c1"), ("b2", "c2"), ("y1", "c1")],
+        )
+        self.assertEqual(sorted(capture["kernels"]), ["1.8/c1", "1.8/c2"])
+        raid = measured["evaluations"]["holdout_raid"]
+        self.assertEqual(raid["fits"], [])
+        self.assertEqual(sorted(raid["unevaluated"]), ["b1", "b2", "y1"])
+        self.assertEqual(
+            list(nearest["evaluations"]["in_sample"]["groups"]), ["s=1", "1.8"]
+        )
+        self.assertEqual(
+            nearest["evaluations"]["in_sample"]["groups"]["s=1"]["mismatch"],
+            0,
+        )
+        self.assertNotIn("holdout_capture", nearest["evaluations"])
+        self.assertEqual(
+            payload["rows"],
+            [{"raid": "A", "slot": 1, "text": "가", "plain": 3, "glow": 1}],
+        )
+        self.assertIn("| measured-bucket | 0/", report)
+        self.assertIn("## s=1 구간", report)
+        self.assertIn("## s 1.8 구간", report)
         self.assertEqual(
             residuals,
             [
-                "b1_measured-kernel.png",
-                "b2_measured-kernel.png",
-                "y1_measured-kernel.png",
+                "b1_measured-bucket.png",
+                "b2_measured-bucket.png",
+                "y1_measured-bucket.png",
             ],
         )
 
+    def test_derived_candidate_reuses_the_base_fit_and_gain_is_fitted(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        references = self.references(
+            glyphs,
+            StandardKernel("bilinear", 1.1),
+            {
+                "b1": (1.5, (3.3, 2.1), PLAIN_FILL),
+                "b2": (1.5, (7.0, 4.6), PLAIN_FILL),
+            },
+        )
+        infos = [
+            self.sample_info("b1", 1.5, "c1"),
+            self.sample_info("b2", 1.5, "c2"),
+        ]
+        payload, _, _, _ = self.run_measured(
+            infos,
+            references,
+            measured_settings(
+                candidates=[
+                    "measured-bucket",
+                    "measured-bucket-unit",
+                    "bilinear-gain",
+                ],
+                holdouts=["capture"],
+                residuals=[],
+            ),
+        )
+        measured, unit, gain = payload["candidates"]
+        base_kernel = measured["evaluations"]["in_sample"]["kernels"]["1.5"]
+        unit_kernel = unit["evaluations"]["in_sample"]["kernels"]["1.5"]
+        self.assertAlmostEqual(
+            unit_kernel["integral_x"] * unit_kernel["integral_y"], 1.0
+        )
+        self.assertEqual(unit_kernel["taps_y"], base_kernel["taps_y"])
+        self.assertEqual(
+            sorted(unit["evaluations"]["holdout_capture"]["kernels"]),
+            ["1.5/c1", "1.5/c2"],
+        )
+        self.assertAlmostEqual(
+            gain["evaluations"]["in_sample"]["kernels"]["1.5"]["gain"],
+            1.1,
+            delta=0.02,
+        )
+        self.assertEqual(
+            gain["evaluations"]["in_sample"]["groups"]["1.5"]["mismatch"], 0
+        )
+
+    def test_separate_fit_set_scores_every_crop_as_hold_out(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        references = self.references(
+            glyphs,
+            trapezoid_taps(),
+            {
+                "f1": (1.8, (3.3, 2.1), PLAIN_FILL),
+                "f2": (1.8, (7.0, 4.6), PLAIN_FILL),
+                "s1": (1.8, (5.0, 3.0), PLAIN_FILL),
+                "s2": (1.3, (5.0, 3.0), PLAIN_FILL),
+            },
+        )
+        skipped = []
+        with tempfile.TemporaryDirectory() as directory:
+            run_measured_kernel(
+                Path(directory),
+                [
+                    self.sample_info("s1", 1.8, "d1", "B"),
+                    self.sample_info("s2", 1.3, "d2", "B"),
+                ],
+                skipped,
+                lambda sample: (glyphs, *references[sample.id]),
+                measured_settings(holdouts=["capture"]),
+                [
+                    self.sample_info("f1", 1.8, "c1"),
+                    self.sample_info("f2", 1.8, "c2"),
+                ],
+            )
+            payload = json.loads(
+                (Path(directory) / "measured-kernel.json").read_text("utf-8")
+            )
+            residuals = sorted(
+                path.name for path in (Path(directory) / "residual").iterdir()
+            )
+        (measured,) = payload["candidates"]
+        self.assertEqual(
+            list(measured["evaluations"]), ["in_sample", "holdout_set"]
+        )
+        self.assertEqual(
+            [
+                fit["sample"]
+                for fit in measured["evaluations"]["in_sample"]["fits"]
+            ],
+            ["f1", "f2"],
+        )
+        evaluation = measured["evaluations"]["holdout_set"]
+        self.assertEqual(
+            [(fit["sample"], fit["fold"]) for fit in evaluation["fits"]],
+            [("s1", "1.8")],
+        )
+        self.assertEqual(evaluation["groups"]["1.8"]["mismatch"], 0)
+        self.assertEqual(evaluation["unevaluated"], ["s2"])
+        self.assertEqual(residuals, ["s1_measured-bucket.png"])
+
+    def test_theory_scale_source_resamples_with_the_predicted_scale(self):
+        masks, positions = synthetic_layout()
+        glyphs = GlyphLayout(["dotum", "dotum"], masks, positions, [8, 5])
+        reference, color = self.references(
+            glyphs, trapezoid_taps(), {"b1": (1.8, (3.3, 2.1), PLAIN_FILL)}
+        )["b1"]
+        info = dataclasses.replace(self.sample_info("b1", 1.5), theory=1.8)
+        payload, _, _, _ = self.run_measured(
+            [info],
+            {"b1": (reference, color)},
+            measured_settings(
+                candidates=["nearest2x-bilinear"],
+                residuals=[],
+                scale_source="theory",
+            ),
+        )
+        fits = payload["candidates"][0]["evaluations"]["in_sample"]["fits"]
+        self.assertEqual(fits[0]["group"], "1.5")
+        self.assertAlmostEqual(fits[0]["origin"][0], 3.3, delta=0.1)
+
 
 class FillColorTests(unittest.TestCase):
-    def crop(self, bright):
-        rgba = np.zeros((4, 6, 4), dtype=np.uint8)
-        rgba[..., :3] = 20
+    def crop(self, bright, background):
+        rgba = np.zeros((6, 12, 4), dtype=np.uint8)
+        rgba[..., :3] = background
         rgba[..., 3] = 255
-        rgba[1:3, 1:5, :3] = bright
+        rgba[2:4, 2:10, :3] = bright
 
         return rgba
 
-    def test_blended_fill_still_picks_its_palette_entry(self):
+    def test_glow_background_marks_the_row_whatever_its_fill_reads(self):
+        # A scaled glow row whose blended fill mean sits nearer to the
+        # plain fill than to the glow fill, over the golden background
+        # the glow tints; the same fill over the neutral background is
+        # a plain row.
+        blended = (235, 224, 131)
+        self.assertTrue(is_glow_row(self.crop(blended, (51, 42, 16))))
         self.assertEqual(
-            nearest_fill_color(self.crop((240, 235, 140))),
-            RAID_FILL_COLORS["yellow"],
+            raid_fill_color(self.crop(blended, (51, 42, 16))), GLOW_FILL
         )
+        self.assertFalse(is_glow_row(self.crop(blended, (16, 16, 16))))
         self.assertEqual(
-            nearest_fill_color(self.crop((200, 185, 135))),
-            RAID_FILL_COLORS["beige"],
+            raid_fill_color(self.crop(PLAIN_FILL, (15, 15, 15))), PLAIN_FILL
         )
 
-    def test_crop_without_bright_pixels_is_an_error(self):
+    def test_crop_without_background_pixels_is_an_error(self):
         with self.assertRaises(ValueError):
-            nearest_fill_color(self.crop((90, 90, 90)))
+            is_glow_row(self.crop((200, 200, 200), (120, 120, 120)))
 
 
 class ReportTests(unittest.TestCase):
@@ -1108,3 +1499,54 @@ class SampleLoadingTests(unittest.TestCase):
                     ]
                 )
             self.assertEqual(error.exception.code, 2)
+
+
+class PhaseTests(unittest.TestCase):
+    def test_phase_table_lists_row_and_line_phases_and_implied_scales(self):
+        # Rows 1 and 12 are 231 native rows apart; origins 300.3 rows
+        # apart imply s=1.3, and so do line centers 1 to 11.
+        measured = {
+            "candidates": [
+                {
+                    "name": "measured-bucket",
+                    "evaluations": {
+                        "in_sample": {
+                            "fits": [
+                                {"sample": "c1_slot1", "origin": [12.25, 3.5]},
+                                {
+                                    "sample": "c1_slot12",
+                                    "origin": [12.5, 303.8],
+                                },
+                                {"sample": "c2_slot1", "origin": [2.0, 1.0]},
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+        lines = [
+            {
+                "caseId": "c1",
+                "scale": 1.3,
+                "lines": [
+                    {"line": 1, "center_row": 40.75},
+                    {"line": 11, "center_row": 313.75},
+                    {"line": 5, "center_row": math.nan},
+                ],
+            },
+            {
+                "caseId": "c3",
+                "scale": 1.3,
+                "lines": [{"line": 1, "center_row": 1.0}],
+            },
+        ]
+        rows = phase_table(measured, "measured-bucket", lines)
+        self.assertEqual([row["caseId"] for row in rows], ["c1"])
+        self.assertEqual(rows[0]["rows"], {"1": [0.25, 0.5], "12": [0.5, 0.8]})
+        self.assertEqual(rows[0]["lines"], {"1": 0.75, "11": 0.75})
+        self.assertAlmostEqual(rows[0]["row_scale"], 1.3, places=4)
+        self.assertAlmostEqual(rows[0]["line_scale"], 1.3, places=4)
+        with self.assertRaises(ValueError):
+            phase_table(measured, "bilinear", lines)
+        with self.assertRaises(ValueError):
+            phase_table(measured, "measured-bucket", lines, "holdout_set")
