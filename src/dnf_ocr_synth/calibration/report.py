@@ -123,13 +123,19 @@ def rank_pipelines(
 def residual_image(
     reference: Reference, synthetic: np.ndarray, origin: tuple[int, int]
 ) -> Image.Image:
-    """Stack the crop, the composite, and their difference, zoomed 4x.
+    """Place the synthetic, then stack crop, composite, difference."""
+    composite, _ = composite_over(reference, synthetic, origin)
+
+    return residual_sheet(reference, composite)
+
+
+def residual_sheet(reference: Reference, composite: np.ndarray) -> Image.Image:
+    """Stack the crop, a crop-sized composite, and their difference.
 
     The difference panel shows the gray difference and tints pixels
     red where the product's Otsu result disagrees.
     """
     crop = reference.rgba
-    composite, _ = composite_over(reference, synthetic, origin)
     crop_gray = bt601_gray(crop).astype(np.int16)
     difference = np.abs(crop_gray - bt601_gray(composite).astype(np.int16))
     mismatch = (reference.binarize(composite)[..., 0] == 0) != reference.ink
@@ -150,7 +156,8 @@ def residual_image(
     return sheet
 
 
-def _markdown_table(headers: list[str], rows: list[list[str]]) -> str:
+def markdown_table(headers: list[str], rows: list[list[str]]) -> str:
+    """Render a GitHub Markdown table."""
     lines = [
         "| " + " | ".join(headers) + " |",
         "| " + " | ".join("---" for _ in headers) + " |",
@@ -160,7 +167,8 @@ def _markdown_table(headers: list[str], rows: list[list[str]]) -> str:
     return "\n".join(lines)
 
 
-def _percent(value: float) -> str:
+def percent(value: float) -> str:
+    """Format a ratio as a percentage, or ``inf``."""
     if math.isinf(value):
         return "inf"
 
@@ -234,7 +242,7 @@ def _markdown(
         title = "전체" if bucket == "all" else f"s {bucket} 구간"
         sections.extend(["", f"## {title}: 상위 파이프라인", ""])
         sections.append(
-            _markdown_table(
+            markdown_table(
                 [
                     "순위",
                     "파이프라인",
@@ -248,7 +256,7 @@ def _markdown(
                         str(index + 1),
                         f"`{entry.pipeline}`",
                         str(entry.samples),
-                        _percent(entry.mean_ratio),
+                        percent(entry.mean_ratio),
                         f"{entry.mean_mae:.2f}",
                         f"{entry.mismatch}/{entry.ink}",
                     ]
@@ -275,16 +283,16 @@ def _markdown(
                     f"{sample.scale:.2f}",
                     f"`{own.pipeline}`",
                     f"({own.offset[0]}, {own.offset[1]})",
-                    f"{own.mismatch} ({_percent(own.ratio)})",
+                    f"{own.mismatch} ({percent(own.ratio)})",
                     f"{own.mae:.2f}",
                     f"({lead.offset[0]}, {lead.offset[1]})",
-                    f"{lead.mismatch} ({_percent(lead.ratio)})",
+                    f"{lead.mismatch} ({percent(lead.ratio)})",
                     f"{lead.mae:.2f}",
                 ]
             )
         sections.extend(["", f"### s {bucket} 구간: 샘플별 최적", ""])
         sections.append(
-            _markdown_table(
+            markdown_table(
                 [
                     "샘플",
                     "화면",
@@ -304,7 +312,7 @@ def _markdown(
     if skipped:
         sections.extend(["", "## 건너뛴 샘플", ""])
         sections.append(
-            _markdown_table(
+            markdown_table(
                 ["샘플", "이유"],
                 [[entry.sample, entry.reason] for entry in skipped],
             )

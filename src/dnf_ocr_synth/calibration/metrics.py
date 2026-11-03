@@ -337,6 +337,14 @@ def compare(
 ) -> Comparison:
     """Measure gray MAE under the synthetic and Otsu mismatches."""
     composite, covered = composite_over(reference, synthetic, origin)
+
+    return score_composite(reference, composite, covered)
+
+
+def score_composite(
+    reference: Reference, composite: np.ndarray, covered: np.ndarray
+) -> Comparison:
+    """Score a crop-sized composite; MAE covers ``covered`` plus 1px."""
     region = dilate(covered)
     if region.any():
         difference = np.abs(
@@ -386,15 +394,7 @@ def edge_profile(
     of the step. A crisp edge gives about 1 row; an edge scaled with
     the glyph filter spreads over about ``scale`` rows.
     """
-    pixels = np.asarray(image)
-    rows = list(range(y - window, y + window + 1))
-    inside = [row for row in rows if 0 <= row < pixels.shape[0]]
-    if len(inside) != len(rows):
-        raise ValueError("The window reaches outside the image.")
-    band = pixels[rows[0] : rows[-1] + 1, x : x + width, channel]
-    if band.shape[1] != width:
-        raise ValueError("The column range reaches outside the image.")
-    values = band.astype(np.float64).mean(axis=1).tolist()
+    rows, values = _row_means(image, x, width, y, window, channel)
     low, high = min(values), max(values)
     if high - low < 1:
         return EdgeProfile(rows, values, low, high, math.nan)
@@ -405,3 +405,62 @@ def edge_profile(
     )
 
     return EdgeProfile(rows, values, low, high, rise)
+
+
+def _row_means(
+    image: np.ndarray, x: int, width: int, y: int, window: int, channel: int
+) -> tuple[list[int], list[float]]:
+    pixels = np.asarray(image)
+    rows = list(range(y - window, y + window + 1))
+    inside = [row for row in rows if 0 <= row < pixels.shape[0]]
+    if len(inside) != len(rows):
+        raise ValueError("The window reaches outside the image.")
+    band = pixels[rows[0] : rows[-1] + 1, x : x + width, channel]
+    if band.shape[1] != width:
+        raise ValueError("The column range reaches outside the image.")
+
+    return rows, band.astype(np.float64).mean(axis=1).tolist()
+
+
+@dataclass(frozen=True)
+class LineProfile:
+    """Describe how a dark horizontal line spreads over rows."""
+
+    rows: list[int]
+    values: list[float]
+    width_rows: float
+
+
+def line_width(values: list[float]) -> float:
+    """Measure the darkest dip's full width at half depth, in rows.
+
+    Each side's half level sits between the dip and that side's
+    brightest value, so a line between differently lit rows is still
+    measured from its own edges. A native line of ``n`` rows scaled
+    with the layer by ``s`` measures about ``n * s``, while a line
+    redrawn crisp measures a whole number of rows.
+    """
+    center = min(range(len(values)), key=values.__getitem__)
+    low = values[center]
+    above = values[: center + 1][::-1]
+    below = values[center:]
+    if len(above) < 2 or len(below) < 2:
+        return math.nan
+    up = _crossing(above, (low + max(above)) / 2)
+    down = _crossing(below, (low + max(below)) / 2)
+
+    return up + down
+
+
+def line_profile(
+    image: np.ndarray,
+    x: int,
+    width: int,
+    y: int,
+    window: int = 3,
+    channel: int = 0,
+) -> LineProfile:
+    """Average one channel across columns around a dark line."""
+    rows, values = _row_means(image, x, width, y, window, channel)
+
+    return LineProfile(rows, values, line_width(values))
